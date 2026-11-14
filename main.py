@@ -2,8 +2,8 @@
 
 Binds an ephemeral port, POSTs it to $MAKEFUN_ENV_URL/register, and polls
 GET $MAKEFUN_ENV_URL/done until the suite answers {"done": true}. The HTTP
-server speaks HTTP/1.1 keep-alive. This revision serves git smart HTTP;
-REST, GraphQL, and MCP are attached beside it.
+server speaks HTTP/1.1 keep-alive. Git smart HTTP, REST v3, and GraphQL are
+served from one store; MCP is attached beside them.
 """
 
 from __future__ import annotations
@@ -23,6 +23,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import gitstore  # noqa: E402
+import gql  # noqa: E402
+import rest  # noqa: E402
 from store import get_store  # noqa: E402
 
 REQUEST_TIMEOUT = 30
@@ -134,11 +136,18 @@ def dispatch(method: str, path: str, query: str, body: bytes, header_map: dict[s
         return 200, b'{"ok":true}', JSON, ()
     if not authorized(header_map.get("authorization", "")):
         return 401, UNAUTH, JSON, ()
+    if path == "/api/graphql":
+        if method != "POST":
+            return 404, NOT_FOUND, JSON, ()
+        return gql.handle(body)
     if gitstore.parse_git_path(path) is not None:
         protocol = header_map.get("git-protocol", "")
         result = gitstore.handle_git(method, path, query, body, protocol)
         if result is not None:
             return result
+    hosted = rest.handle_rest(method, path, query, body, header_map.get("host", ""))
+    if hosted is not None:
+        return hosted
     return 404, NOT_FOUND, JSON, ()
 
 

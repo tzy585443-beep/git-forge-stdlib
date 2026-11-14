@@ -90,6 +90,16 @@ class Issue:
         self.cache: bytes | None = None
 
 
+class Comment:
+    __slots__ = ("id", "body", "created_at", "updated_at")
+
+    def __init__(self, id_: int, body: str, now: str):
+        self.id = id_
+        self.body = body
+        self.created_at = now
+        self.updated_at = now
+
+
 class Pull:
     __slots__ = (
         "id",
@@ -137,6 +147,7 @@ class Repo:
         "next_number",
         "open_count",
         "pulls",
+        "comments",
         "lock",
         "git",
     )
@@ -165,6 +176,7 @@ class Repo:
         self.next_number = 1
         self.open_count = 0
         self.pulls: dict[int, Pull] = {}
+        self.comments: dict[int, list] = {}
         self.lock = threading.RLock()
         self.git = None
 
@@ -223,7 +235,7 @@ class Store:
 
     def create_repo(self, data: dict) -> tuple[int, dict]:
         name = data.get("name")
-        if not isinstance(name, str) or not name.strip() or "/" in name or name in (".", "..") or name.endswith(".git"):
+        if not isinstance(name, str) or not name.strip() or "/" in name or name in (".", ".."):
             return 422, _validation("Repository", "name", "invalid")
         name = name.strip()
         key = name.lower()
@@ -627,6 +639,38 @@ class Store:
             repo.open_count = max(0, repo.open_count - 1)
             repo.updated_at = self.now
         return 200, {"sha": sha, "merged": True, "message": "Pull Request successfully merged"}
+
+    def create_comment(self, repo: Repo, number: int, data: dict) -> tuple[int, dict]:
+        body = data.get("body")
+        if not isinstance(body, str) or not body:
+            return 422, _validation("IssueComment", "body", "missing")
+        with repo.lock:
+            if number not in repo.issues and number not in repo.pulls:
+                return 404, {"message": "Not Found"}
+            comment = Comment(self.alloc_obj(), body, self.now)
+            repo.comments.setdefault(number, []).append(comment)
+        return 201, self.comment_public(repo, number, comment)
+
+    def list_comments(self, repo: Repo, number: int) -> list | None:
+        with repo.lock:
+            if number not in repo.issues and number not in repo.pulls:
+                return None
+            return list(repo.comments.get(number, ()))
+
+    def comment_public(self, repo: Repo, number: int, comment: Comment) -> dict:
+        full = f"{self.login}/{repo.name}"
+        return {
+            "id": comment.id,
+            "node_id": node_id("IssueComment", comment.id),
+            "body": comment.body,
+            "user": self.user_public(),
+            "created_at": comment.created_at,
+            "updated_at": comment.updated_at,
+            "author_association": "OWNER",
+            "html_url": f"/{full}/issues/{number}#issuecomment-{comment.id}",
+            "url": f"/api/v3/repos/{full}/issues/comments/{comment.id}",
+            "issue_url": f"/api/v3/repos/{full}/issues/{number}",
+        }
 
     def pull_as_issue(self, repo: Repo, pull: Pull) -> dict:
         full = f"{self.login}/{repo.name}"
