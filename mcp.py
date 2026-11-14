@@ -1,15 +1,19 @@
 """Model Context Protocol endpoint at /mcp.
 
 Speaks revision 2026-07-28 (server/discover advertises supportedVersions) and
-the earlier initialize handshake. tools/list is a fixed document so two calls
-match byte for byte.
+the earlier initialize handshake. tools/list is one fixed document, so two
+calls match byte for byte. Tool names match on a case-insensitive suffix, which
+is how a github__create_issue prefix resolves.
 """
 
 from __future__ import annotations
 
 import json
 
+from store import get_store
+
 JSON = "application/json; charset=utf-8"
+SSE = "text/event-stream"
 VERSIONS = ["2026-07-28", "2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"]
 
 TOOLS = [
@@ -105,7 +109,7 @@ TOOLS = [
     },
 ]
 
-_TOOL_BY_NAME = {tool["name"]: tool for tool in TOOLS}
+_BY_NAME = {tool["name"]: tool for tool in TOOLS}
 
 
 def dumps(obj: object) -> bytes:
@@ -128,8 +132,8 @@ def _error(id_, code: int, message: str) -> dict:
 def _tool_named(name: str) -> dict | None:
     if not isinstance(name, str) or not name:
         return None
-    direct = _TOOL_BY_NAME.get(name)
-    if direct:
+    direct = _BY_NAME.get(name)
+    if direct is not None:
         return direct
     lowered = name.lower().replace("-", "_")
     for tool in TOOLS:
@@ -152,8 +156,7 @@ def _owner_repo(args: dict) -> tuple[str, str]:
 
 def _missing(tool: dict, args: dict) -> str | None:
     for name in tool["inputSchema"].get("required", []):
-        # full_name can satisfy owner and repo together.
-        if name in ("owner", "repo") and args.get("full_name"):
+        if name in ("owner", "repo"):
             owner, repo = _owner_repo(args)
             if name == "owner" and owner:
                 continue
@@ -172,8 +175,7 @@ def _text(payload, is_error: bool = False) -> dict:
 
 
 def _call_tool(tool: dict, args: dict) -> dict:
-    from gitstore import ensure_git
-    from store import get_store
+    import gitstore
 
     store = get_store()
     name = tool["name"]
@@ -186,9 +188,9 @@ def _call_tool(tool: dict, args: dict) -> dict:
         })
         if status != 201:
             return _text(repo, True)
-        created = store.get_repo(store.login, str(args.get("name")))
+        created = store.get_repo(store.login, str(args.get("name") or ""))
         if created is not None:
-            ensure_git(created, store)
+            gitstore.ensure_git(created, store)
             repo = store.repo_public(created)
         return _text(repo)
     owner, repo_name = _owner_repo(args)
@@ -206,12 +208,12 @@ def _call_tool(tool: dict, args: dict) -> dict:
         return _text(issue)
     if name == "list_issues":
         state = args.get("state") or "open"
-        if state not in ("open", "closed", "all"):
+        if not isinstance(state, str) or state not in ("open", "closed", "all"):
             state = "open"
         issues = [store.issue_public(repo, issue) for issue in store.list_issues(repo, state)]
         return _text(issues)
     if name == "create_pull_request":
-        ensure_git(repo, store)
+        gitstore.ensure_git(repo, store)
         status, pull = store.create_pull(repo, {
             "title": args.get("title"),
             "head": args.get("head"),
@@ -222,7 +224,7 @@ def _call_tool(tool: dict, args: dict) -> dict:
             return _text(pull, True)
         return _text(pull)
     if name == "merge_pull_request":
-        ensure_git(repo, store)
+        gitstore.ensure_git(repo, store)
         number = args.get("pull_number")
         try:
             number = int(number)
@@ -242,13 +244,13 @@ def _call_tool(tool: dict, args: dict) -> dict:
 
 
 def _handle_object(message: dict) -> tuple[dict | None, list[tuple[str, str]]]:
-    if not isinstance(message, dict) or message.get("jsonrpc") not in (None, "2.0"):
-        return _error(message.get("id") if isinstance(message, dict) else None, -32600, "Invalid Request"), []
+    if not isinstance(message, dict):
+        return _error(None, -32600, "Invalid Request"), []
+    if message.get("jsonrpc") not in (None, "2.0"):
+        return _error(message.get("id"), -32600, "Invalid Request"), []
     method = message.get("method")
     id_ = message.get("id", None)
-    params = message.get("params") or {}
-    if not isinstance(params, dict):
-        params = {}
+    params = message.get("params") if isinstance(message.get("params"), dict) else {}
     headers: list[tuple[str, str]] = []
     if not isinstance(method, str):
         return _error(id_, -32600, "Invalid Request"), headers
@@ -283,9 +285,7 @@ def _handle_object(message: dict) -> tuple[dict | None, list[tuple[str, str]]]:
         tool = _tool_named(params.get("name"))
         if tool is None:
             return _error(id_, -32602, f"Unknown tool: {params.get('name')}"), headers
-        arguments = params.get("arguments") or {}
-        if not isinstance(arguments, dict):
-            return _error(id_, -32602, "Invalid arguments"), headers
+        arguments = params.get("arguments") if isinstance(params.get("arguments"), dict) else {}
         missing = _missing(tool, arguments)
         if missing:
             return _error(id_, -32602, f"Missing required argument: {missing}"), headers
@@ -296,13 +296,21 @@ def _handle_object(message: dict) -> tuple[dict | None, list[tuple[str, str]]]:
     return _error(id_, -32601, f"Method not found: {method}"), headers
 
 
-def handle(body: bytes) -> tuple:
+def _frame(status: int, payload: bytes, headers: list, accept: str) -> tuple:
+    accept = (accept or "").lower()
+    if "text/event-stream" in accept and "application/json" not in accept and status != 202:
+        event = b"event: message\ndata: " + payload.replace(b"\n", b"") + b"\n\n"
+        return status, event, SSE, headers
+    return status, payload, JSON, headers
+
+
+def handle(body: bytes, accept: str = "") -> tuple:
     if not body or not body.strip():
-        return 400, dumps(_error(None, -32700, "Parse error")), JSON, []
+        return _frame(400, dumps(_error(None, -32700, "Parse error")), [], accept)
     try:
         payload = json.loads(body)
     except json.JSONDecodeError:
-        return 400, dumps(_error(None, -32700, "Parse error")), JSON, []
+        return _frame(400, dumps(_error(None, -32700, "Parse error")), [], accept)
     if isinstance(payload, list):
         results = []
         headers: list[tuple[str, str]] = []
@@ -311,10 +319,10 @@ def handle(body: bytes) -> tuple:
             if result is not None:
                 results.append(result)
             headers.extend(extra)
-        return 200, dumps(results), JSON, headers
+        return _frame(200, dumps(results), headers, accept)
     if not isinstance(payload, dict):
-        return 400, dumps(_error(None, -32700, "Parse error")), JSON, []
+        return _frame(400, dumps(_error(None, -32700, "Parse error")), [], accept)
     result, headers = _handle_object(payload)
     if result is None:
         return 202, b"", JSON, headers
-    return 200, dumps(result), JSON, headers
+    return _frame(200, dumps(result), headers, accept)

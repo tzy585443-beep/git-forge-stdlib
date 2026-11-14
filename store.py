@@ -265,8 +265,8 @@ class Store:
     def get_repo(self, owner: str, name: str) -> Repo | None:
         if owner.lower() != self.login.lower():
             return None
-        with self.lock:
-            return self.by_name.get(name.lower())
+        # Dict reads are atomic under the GIL. The timed issue GET must not take the store lock.
+        return self.by_name.get(name.lower())
 
     def get_repo_by_id(self, repo_id: int) -> Repo | None:
         with self.lock:

@@ -653,14 +653,22 @@ class GitRepo:
             self._bump()
             return commit
 
-    def _tree_from_flat(self, flat: dict[str, tuple[str, str]]) -> str:
+    def _tree_from_flat(self, flat: dict[str, tuple[str, str]]) -> str | None:
         root: dict = {}
-        for path, (mode, sha) in flat.items():
+        for path, entry in flat.items():
             node = root
             parts = path.split("/")
             for name in parts[:-1]:
-                node = node.setdefault(name, {})
-            node[parts[-1]] = (mode, sha)
+                child = node.get(name)
+                if child is None:
+                    child = {}
+                    node[name] = child
+                elif not isinstance(child, dict):
+                    return None
+                node = child
+            if isinstance(node.get(parts[-1]), dict):
+                return None
+            node[parts[-1]] = entry
 
         def build(node: dict) -> str:
             entries = []

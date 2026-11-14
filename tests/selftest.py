@@ -41,12 +41,8 @@ def sha1(*parts: bytes) -> str:
     return digest.hexdigest()
 
 
-def object_bytes(typ: str, content: bytes) -> bytes:
-    return f"{typ} {len(content)}\0".encode() + content
-
-
 def oid_of(typ: str, content: bytes) -> str:
-    return sha1(object_bytes(typ, content))
+    return sha1(f"{typ} {len(content)}\0".encode() + content)
 
 
 def pkt(data: bytes | str) -> bytes:
@@ -56,13 +52,8 @@ def pkt(data: bytes | str) -> bytes:
 
 
 def encode_tree(entries: list[tuple[str, str, str]]) -> bytes:
-    def key(entry: tuple[str, str, str]) -> bytes:
-        mode, name, _sha = entry
-        raw = name.encode()
-        return raw + b"/" if mode == "40000" else raw
-
     out = bytearray()
-    for mode, name, sha in sorted(entries, key=key):
+    for mode, name, sha in sorted(entries, key=lambda item: item[1].encode()):
         out += f"{mode} {name}".encode() + b"\0" + bytes.fromhex(sha)
     return bytes(out)
 
@@ -107,7 +98,6 @@ def read_pkts(buf: bytes):
 
 
 def unpack_sideband(buf: bytes) -> bytes:
-    """Collect band-1 bytes until a flush packet."""
     out = bytearray()
     index = 0
     while index + 4 <= len(buf):
@@ -161,7 +151,7 @@ class Client:
         req = urllib.request.Request(self.base + path, data=body, method=method)
         if token:
             req.add_header("Authorization", "Bearer " + token)
-        if body is not None and not (headers and any(k.lower() == "content-type" for k in headers)):
+        if body is not None and not (headers and any(key.lower() == "content-type" for key in headers)):
             req.add_header("Content-Type", "application/json")
         for key, value in (headers or {}).items():
             req.add_header(key, value)
@@ -195,13 +185,13 @@ def commit_object(tree: str, parents: list[str], message: str) -> bytes:
     return text.encode()
 
 
-def _ref_oid(body: bytes, refname: str) -> str:
+def ref_oid(body: bytes, refname: str) -> str:
     items, _rest = read_pkts(body)
     marker = f" {refname}".encode()
     for item in items:
         if item and item.rstrip(b"\n").endswith(marker):
             return item.split()[0].decode()
-    raise SystemExit(f"FAIL missing ref {refname} in {body!r}")
+    raise SystemExit(f"FAIL missing ref {refname} in {body[:300]!r}")
 
 
 def check(cond, message: str) -> None:
@@ -220,20 +210,20 @@ def main_test() -> None:
     status, _body, _headers = client.json("GET", "/healthz", token=None)
     check(status == 200, "healthz")
     status, body, _headers = client.json("GET", "/api/v3/user", token=None)
-    check(status == 401 and "message" in body, "missing token is 401")
+    check(status == 401 and isinstance(body, dict) and "message" in body, "missing token is 401")
     status, body, headers = client.json("GET", "/api/v3/")
     scopes = headers.get("X-Oauth-Scopes") or headers.get("X-OAuth-Scopes") or ""
-    check(status == 200 and "repo" in scopes, "api root scopes")
+    check(status == 200 and "repo" in scopes, f"api root scopes {scopes}")
     check(headers.get("X-Github-Request-Id") or headers.get("X-GitHub-Request-Id"), "request id")
     status, body, _headers = client.json("GET", "/api/v3/meta")
     check(status == 200 and body["installed_version"], "meta")
     status, body, _headers = client.request("POST", "/api/v3/user/repos", b"{")
-    check(status == 400 and body.startswith(b"{"), "bad json")
+    check(status == 400 and body.startswith(b"{"), f"bad json {status} {body!r}")
     status, body, _headers = client.json("GET", "/no/such")
     check(status == 404 and body["message"], "unknown route json")
 
     status, repo, _headers = client.json("POST", "/api/v3/user/repos", {"name": "demo", "description": "d", "auto_init": True})
-    check(status == 201 and repo["owner"]["login"] == login, "create repo")
+    check(status == 201 and repo["owner"]["login"] == login, f"create repo {status} {repo}")
     status, got, _headers = client.json("GET", f"/api/v3/repos/{login}/demo")
     check(status == 200 and got["description"] == "d", "get repo")
     status, got, _headers = client.json("PATCH", f"/api/v3/repos/{login}/demo", {"description": "new"})
@@ -250,22 +240,24 @@ def main_test() -> None:
     check(status == 200 and again["id"] == issue["id"], "get issue id stable")
     status, closed, _headers = client.json("PATCH", f"/api/v3/repos/{login}/demo/issues/{issue['number']}", {"state": "closed"})
     check(closed["state"] == "closed", "close issue")
-    status, opened, _headers = client.json("POST", f"/api/v3/repos/{login}/demo/issues", {"title": "two"})
-    status, third, _headers = client.json("POST", f"/api/v3/repos/{login}/demo/issues", {"title": "three"})
+    status, _opened, _headers = client.json("POST", f"/api/v3/repos/{login}/demo/issues", {"title": "two"})
+    status, _third, _headers = client.json("POST", f"/api/v3/repos/{login}/demo/issues", {"title": "three"})
     check(status == 201, "third issue")
 
-    # A second page of repositories carries rel="next".
     for index in range(32):
         status, _body, _headers = client.json("POST", "/api/v3/user/repos", {"name": f"r{index}"})
-        check(status == 201, f"repo r{index}")
+        check(status == 201, f"repo r{index} {status} {_body}")
     status, page, headers = client.json("GET", "/api/v3/user/repos")
-    check(status == 200 and len(page) == 30 and 'rel="next"' in (headers.get("Link") or ""), "repo pagination")
+    check(status == 200 and len(page) == 30 and 'rel="next"' in (headers.get("Link") or ""), f"repo pagination {len(page)} {headers.get('Link')}")
 
-    # Contents: create, stale sha, update, delete.
     encoded = base64.b64encode(b"hello\n").decode()
-    status, created, _headers = client.json("PUT", f"/api/v3/repos/{login}/demo/contents/notes.txt", {"message": "add", "content": encoded})
-    check(status == 201 and created["content"]["sha"] == oid_of("blob", b"hello\n"), "put file")
-    status, _body, _headers = client.json("PUT", f"/api/v3/repos/{login}/demo/contents/notes.txt", {"message": "stale", "content": encoded, "sha": ZERO})
+    status, created, _headers = client.json(
+        "PUT", f"/api/v3/repos/{login}/demo/contents/notes.txt", {"message": "add", "content": encoded}
+    )
+    check(status == 201 and created["content"]["sha"] == oid_of("blob", b"hello\n"), f"put file {status}")
+    status, _body, _headers = client.json(
+        "PUT", f"/api/v3/repos/{login}/demo/contents/notes.txt", {"message": "stale", "content": encoded, "sha": ZERO}
+    )
     check(status == 409, "stale sha")
     encoded2 = base64.b64encode(b"hello!\n").decode()
     status, updated, _headers = client.json(
@@ -273,13 +265,13 @@ def main_test() -> None:
         f"/api/v3/repos/{login}/demo/contents/notes.txt",
         {"message": "edit", "content": encoded2, "sha": created["content"]["sha"]},
     )
-    check(status == 200, "update file")
-    status, _body, _headers = client.json(
+    check(status == 200, f"update file {status}")
+    status, removed, _headers = client.json(
         "DELETE",
         f"/api/v3/repos/{login}/demo/contents/notes.txt",
         {"message": "rm", "sha": updated["content"]["sha"]},
     )
-    check(status == 200 and _body["commit"]["sha"], "delete file")
+    check(status == 200 and removed["commit"]["sha"], "delete file")
     status, _body, _headers = client.json("GET", f"/api/v3/repos/{login}/demo/contents/notes.txt")
     check(status == 404, "deleted file is 404")
 
@@ -299,7 +291,6 @@ def main_test() -> None:
     blob_id = oid_of("blob", blob)
     tree = encode_tree([("100644", "pushed.txt", blob_id)])
     tree_id = oid_of("tree", tree)
-    # First push creates main. Read the current tip so the update fast-forwards.
     ls_body = b"".join([
         pkt("command=ls-refs\n"),
         b"0001",
@@ -309,16 +300,19 @@ def main_test() -> None:
         pkt("ref-prefix HEAD\n"),
         b"0000",
     ])
-    status, listed, _headers = client.git("POST", remote + "/git-upload-pack", ls_body, "version=2", "application/x-git-upload-pack-request")
-    check(status == 200 and b"refs/heads/main" in listed, "ls-refs")
-    tip = _ref_oid(listed, "refs/heads/main")
-    # auto_init created main, so tip is set. Build a child commit.
+    status, listed, _headers = client.git(
+        "POST", remote + "/git-upload-pack", ls_body, "version=2", "application/x-git-upload-pack-request"
+    )
+    check(status == 200 and b"refs/heads/main" in listed, f"ls-refs {listed[:200]!r}")
+    tip = ref_oid(listed, "refs/heads/main")
     check(tip and tip != ZERO, f"main tip {tip}")
     commit = commit_object(tree_id, [tip], "push one\n")
     commit_id = oid_of("commit", commit)
     pack = build_pack([("blob", blob), ("tree", tree), ("commit", commit)])
     push = pkt(f"{tip} {commit_id} refs/heads/main\0 report-status side-band-64k\n") + b"0000" + pack
-    status, report, _headers = client.git("POST", remote + "/git-receive-pack", push, content_type="application/x-git-receive-pack-request")
+    status, report, _headers = client.git(
+        "POST", remote + "/git-receive-pack", push, content_type="application/x-git-receive-pack-request"
+    )
     check(status == 200 and b"ok refs/heads/main" in report and b"unpack ok" in report, f"push report {report!r}")
 
     fetch = b"".join([
@@ -331,27 +325,22 @@ def main_test() -> None:
         pkt("ofs-delta\n"),
         b"0000",
     ])
-    status, fetched, _headers = client.git("POST", remote + "/git-upload-pack", fetch, "version=2", "application/x-git-upload-pack-request")
+    status, fetched, _headers = client.git(
+        "POST", remote + "/git-upload-pack", fetch, "version=2", "application/x-git-upload-pack-request"
+    )
     check(status == 200 and b"shallow-info" in fetched and b"packfile" in fetched, "shallow fetch headers")
-    _lines, rest = read_pkts(fetched)
-    # read_pkts stops at the first flush inside shallow lines? shallow section ends with delim 0001, not flush.
-    # Re-scan for packfile then sideband.
     marker = b"packfile\n"
     at = fetched.find(marker)
     check(at > 0, "packfile section")
-    # The pkt length prefix sits 4 bytes before the word.
-    after = fetched[at + len(marker) :]
-    pack_bytes = unpack_sideband(after)
-    objects = parse_pack(pack_bytes)
+    objects = parse_pack(unpack_sideband(fetched[at + len(marker) :]))
     check(blob_id in objects and objects[blob_id][1] == blob, "shallow pack contains the blob")
     check(commit_id in objects, "shallow pack contains the commit")
-    # Depth 1 must not include the parent commit object.
     check(tip not in objects, "depth 1 omits the parent commit")
 
-    # Seed topic at the current tip so the next push can refuse a non-fast-forward
-    # while still accepting a fast-forward of main.
     seed = pkt(f"{ZERO} {commit_id} refs/heads/topic\0 report-status side-band-64k\n") + b"0000"
-    status, report, _headers = client.git("POST", remote + "/git-receive-pack", seed, content_type="application/x-git-receive-pack-request")
+    status, report, _headers = client.git(
+        "POST", remote + "/git-receive-pack", seed, content_type="application/x-git-receive-pack-request"
+    )
     check(b"ok refs/heads/topic" in report, f"seed topic {report!r}")
     side_blob = b"side\n"
     side_blob_id = oid_of("blob", side_blob)
@@ -376,38 +365,56 @@ def main_test() -> None:
         b"0000",
         pack,
     ])
-    status, report, _headers = client.git("POST", remote + "/git-receive-pack", push, content_type="application/x-git-receive-pack-request")
+    status, report, _headers = client.git(
+        "POST", remote + "/git-receive-pack", push, content_type="application/x-git-receive-pack-request"
+    )
     check(b"ok refs/heads/main" in report, f"ff ref applied {report!r}")
     check(b"ng refs/heads/topic non-fast-forward" in report, f"non-ff refused {report!r}")
 
-    status, pull, _headers = client.json("POST", f"/api/v3/repos/{login}/demo/pulls", {"title": "P", "head": "main", "base": "main"})
+    status, _pull, _headers = client.json("POST", f"/api/v3/repos/{login}/demo/pulls", {"title": "P", "head": "main", "base": "main"})
     check(status == 422, "same-branch pull rejected")
-    # topic does not exist; push a real fast-forward branch by creating it from zero.
     branch_commit = commit_object(side_tree_id, [good_id], "topic\n")
     branch_id = oid_of("commit", branch_commit)
     pack = build_pack([("commit", branch_commit)])
     push = pkt(f"{commit_id} {branch_id} refs/heads/topic\0 report-status side-band-64k\n") + b"0000" + pack
-    status, report, _headers = client.git("POST", remote + "/git-receive-pack", push, content_type="application/x-git-receive-pack-request")
+    status, report, _headers = client.git(
+        "POST", remote + "/git-receive-pack", push, content_type="application/x-git-receive-pack-request"
+    )
     check(b"ok refs/heads/topic" in report, f"create branch {report!r}")
-    status, pull, _headers = client.json("POST", f"/api/v3/repos/{login}/demo/pulls", {"title": "Topic", "head": "topic", "base": "main", "body": "please"})
-    check(status == 201 and pull["state"] == "open" and pull["head"]["ref"] == "topic" and pull["base"]["ref"] == "main", "open pull")
+    status, pull, _headers = client.json(
+        "POST", f"/api/v3/repos/{login}/demo/pulls", {"title": "Topic", "head": "topic", "base": "main", "body": "please"}
+    )
+    check(
+        status == 201 and pull["state"] == "open" and pull["head"]["ref"] == "topic" and pull["base"]["ref"] == "main",
+        f"open pull {status} {pull}",
+    )
     status, merged, _headers = client.json("PUT", f"/api/v3/repos/{login}/demo/pulls/{pull['number']}/merge", {})
-    check(status == 200 and merged["merged"] is True and merged["sha"], "squash merge")
+    check(status == 200 and merged["merged"] is True and merged["sha"], f"squash merge {status} {merged}")
     status, _body, _headers = client.json("GET", f"/api/v3/repos/{login}/demo/pulls/9999")
     check(status == 404, "unknown pull")
+    status, _body, _headers = client.json("DELETE", f"/api/v3/repos/{login}/r0")
+    check(status == 204, "delete repo")
+    status, _body, _headers = client.json("GET", f"/api/v3/repos/{login}/r0")
+    check(status == 404, "deleted repo is 404")
 
-    # GraphQL.
-    status, data, _headers = client.json("POST", "/api/graphql", {"query": "{ viewer { login } }"}, token=None)
+    status, _body, _headers = client.json("POST", "/api/graphql", {"query": "{ viewer { login } }"}, token=None)
     check(status == 401, "graphql auth")
-    query = """query { __type(name: "Issue") { fields { name } } }"""
+    query = 'query { __type(name: "Issue") { fields { name } } }'
     status, data, _headers = client.json("POST", "/api/graphql", {"query": query})
     names = {field["name"] for field in data["data"]["__type"]["fields"]}
     check({"id", "number", "title", "state", "body"} <= names, "issue introspection")
-    query = """query { __type(name: "Repository") { fields { name } } }"""
+    query = 'query { __type(name: "PullRequest") { fields { name } } }'
     status, data, _headers = client.json("POST", "/api/graphql", {"query": query})
     names = {field["name"] for field in data["data"]["__type"]["fields"]}
-    check({"id", "databaseId", "issues", "pullRequest", "pullRequests", "defaultBranchRef"} <= names, "repo introspection")
-    query = """query { __type(name: "SearchType") { enumValues { name } } }"""
+    check({"id", "number", "headRefName", "baseRefName", "mergeable", "state", "merged", "files"} <= names, "pull introspection")
+    query = 'query { __type(name: "Repository") { fields { name } } }'
+    status, data, _headers = client.json("POST", "/api/graphql", {"query": query})
+    names = {field["name"] for field in data["data"]["__type"]["fields"]}
+    check(
+        {"id", "databaseId", "name", "nameWithOwner", "owner", "defaultBranchRef", "viewerPermission", "hasIssuesEnabled", "issue", "issues", "pullRequests", "pullRequest"} <= names,
+        "repo introspection",
+    )
+    query = 'query { __type(name: "SearchType") { enumValues { name } } }'
     status, data, _headers = client.json("POST", "/api/graphql", {"query": query})
     check("ISSUE" in {item["name"] for item in data["data"]["__type"]["enumValues"]}, "SearchType")
     query = """query($owner:String!,$name:String!){
@@ -417,7 +424,7 @@ def main_test() -> None:
     numbers = [node["number"] for node in data["data"]["repository"]["issues"]["nodes"]]
     check(numbers == sorted(numbers, reverse=True) and issue["number"] not in numbers, f"open issues desc {numbers}")
     status, data, _headers = client.json("POST", "/api/graphql", {"query": '{ repository(owner:"nope", name:"demo") { name } }'})
-    check(data["data"]["repository"] is None and "errors" not in data, "unknown repository")
+    check(data["data"]["repository"] is None and "errors" not in data, f"unknown repository {data}")
     status, data, _headers = client.json("POST", "/api/graphql", {"query": '{ repository(owner:"octocat", name:"demo") { notAField } }'})
     check(status == 200 and any("notAField" in err["message"] for err in data["errors"]), "unknown field")
     status, raw, _headers = client.request(
@@ -429,12 +436,16 @@ def main_test() -> None:
         ]).encode(),
     )
     batch = json.loads(raw)
-    check(status == 200 and batch[0]["data"]["viewer"]["login"] == login and batch[1]["data"]["repository"]["name"] == "demo", "batch")
+    check(
+        status == 200 and batch[0]["data"]["viewer"]["login"] == login and batch[1]["data"]["repository"]["name"] == "demo",
+        f"batch {batch}",
+    )
     status, data, _headers = client.json("POST", "/api/graphql", {"query": '{ repository(owner:"octocat", name:"demo") { id } }'})
     repo_id = data["data"]["repository"]["id"]
-    # Another branch off the post-merge main, discovered via ls-refs.
-    status, listed, _headers = client.git("POST", remote + "/git-upload-pack", ls_body, "version=2", "application/x-git-upload-pack-request")
-    main_tip = _ref_oid(listed, "refs/heads/main")
+    status, listed, _headers = client.git(
+        "POST", remote + "/git-upload-pack", ls_body, "version=2", "application/x-git-upload-pack-request"
+    )
+    main_tip = ref_oid(listed, "refs/heads/main")
     feature_blob = b"feature\n"
     feature_id = oid_of("blob", feature_blob)
     feature_tree = encode_tree([("100644", "feature.txt", feature_id)])
@@ -443,49 +454,103 @@ def main_test() -> None:
     feature_commit_id = oid_of("commit", feature_commit)
     pack = build_pack([("blob", feature_blob), ("tree", feature_tree), ("commit", feature_commit)])
     push = pkt(f"{ZERO} {feature_commit_id} refs/heads/feature\0 report-status side-band-64k\n") + b"0000" + pack
-    status, report, _headers = client.git("POST", remote + "/git-receive-pack", push, content_type="application/x-git-receive-pack-request")
+    status, report, _headers = client.git(
+        "POST", remote + "/git-receive-pack", push, content_type="application/x-git-receive-pack-request"
+    )
     check(b"ok refs/heads/feature" in report, f"feature branch {report!r}")
-    mutation = """mutation($input:CreatePullRequestInput!){ createPullRequest(input:$input){ pullRequest { number headRefName baseRefName } } }"""
+    mutation = "mutation($input:CreatePullRequestInput!){ createPullRequest(input:$input){ pullRequest { number headRefName baseRefName } } }"
     status, data, _headers = client.json("POST", "/api/graphql", {
         "query": mutation,
         "variables": {"input": {"repositoryId": repo_id, "headRefName": "feature", "baseRefName": "main", "title": "From GraphQL"}},
     })
+    check("errors" not in data, f"createPullRequest errors {data}")
     created_pr = data["data"]["createPullRequest"]["pullRequest"]
     check(created_pr["headRefName"] == "feature" and created_pr["baseRefName"] == "main", "createPullRequest")
     status, via_rest, _headers = client.json("GET", f"/api/v3/repos/{login}/demo/pulls/{created_pr['number']}")
     check(status == 200 and via_rest["head"]["ref"] == "feature" and via_rest["base"]["ref"] == "main", "graphql pr readable via rest")
 
-    # MCP.
     status, _body, _headers = client.json("POST", "/mcp", {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}, token=None)
     check(status == 401, "mcp auth")
     status, raw, _headers = client.request("POST", "/mcp", b"nope")
-    check(status == 400 and b"-32700" in raw, "mcp parse error")
+    check(status == 400 and b"-32700" in raw, f"mcp parse error {status} {raw!r}")
     status, data, _headers = client.json("POST", "/mcp", {"jsonrpc": "2.0", "id": "d", "method": "server/discover"})
     versions = data["result"]["supportedVersions"]
     check(versions and all(len(item) == 10 and item[4] == "-" and item[7] == "-" for item in versions), "discover versions")
-    status, data, headers = client.json("POST", "/mcp", {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-03-26", "capabilities": {}}})
+    check("2026-07-28" in versions, "discover advertises 2026-07-28")
+    status, data, headers = client.json("POST", "/mcp", {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {"protocolVersion": "2025-03-26", "capabilities": {}},
+    })
     check(data["result"]["protocolVersion"] == "2025-03-26", "initialize")
-    check(headers.get("Mcp-Session-Id") == "forge", "session id")
-    status, _body, _headers = client.request("POST", "/mcp", json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}).encode())
-    check(status == 202, "initialized notification")
+    check(headers.get("Mcp-Session-Id") == "forge", f"session id {headers}")
+    status, _body, _headers = client.request(
+        "POST", "/mcp", json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}).encode()
+    )
+    check(status == 202, f"initialized notification {status}")
     status, first, _headers = client.request("POST", "/mcp", json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}).encode())
     status, second, _headers = client.request("POST", "/mcp", json.dumps({"jsonrpc": "2.0", "id": 3, "method": "tools/list"}).encode())
     check(first.split(b'"tools":', 1)[1] == second.split(b'"tools":', 1)[1], "tools/list stable")
     tools = json.loads(first)["result"]["tools"]
-    check({tool["name"] for tool in tools} >= {"create_repo", "get_repo", "create_issue", "list_issues", "create_pull_request", "merge_pull_request"}, "tool names")
+    check(
+        {tool["name"] for tool in tools} >= {"create_repo", "get_repo", "create_issue", "list_issues", "create_pull_request", "merge_pull_request"},
+        "tool names",
+    )
     check(all(tool["description"] and tool["inputSchema"]["type"] == "object" for tool in tools), "tool schemas")
     status, data, _headers = client.json("POST", "/mcp", {"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "missing", "arguments": {}}})
     check(data["error"]["code"] in (-32601, -32602), "unknown tool")
-    status, data, _headers = client.json("POST", "/mcp", {"jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": {"name": "create_issue", "arguments": {"owner": login}}})
-    check(data["error"]["code"] == -32602, "missing argument")
-    status, data, _headers = client.json("POST", "/mcp", {"jsonrpc": "2.0", "id": 6, "method": "tools/call", "params": {"name": "create_repo", "arguments": {"name": "mcp-demo"}}})
-    check(data["result"]["isError"] is False, "mcp create_repo")
-    status, data, _headers = client.json("POST", "/mcp", {"jsonrpc": "2.0", "id": 7, "method": "tools/call", "params": {"name": "create_issue", "arguments": {"owner": login, "repo": "mcp-demo", "title": "from mcp", "body": "hi"}}})
+    status, data, _headers = client.json("POST", "/mcp", {
+        "jsonrpc": "2.0",
+        "id": 5,
+        "method": "tools/call",
+        "params": {"name": "github__create_issue", "arguments": {"owner": login}},
+    })
+    check(data["error"]["code"] == -32602, f"missing argument {data}")
+    status, data, _headers = client.json("POST", "/mcp", {
+        "jsonrpc": "2.0",
+        "id": 6,
+        "method": "tools/call",
+        "params": {"name": "create_repo", "arguments": {"name": "mcp-demo"}},
+    })
+    check(data["result"]["isError"] is False, f"mcp create_repo {data}")
+    status, data, _headers = client.json("POST", "/mcp", {
+        "jsonrpc": "2.0",
+        "id": 7,
+        "method": "tools/call",
+        "params": {"name": "create_issue", "arguments": {"owner": login, "repo": "mcp-demo", "title": "from mcp", "body": "hi"}},
+    })
     created_issue = json.loads(data["result"]["content"][0]["text"])
     status, fetched_issue, _headers = client.json("GET", f"/api/v3/repos/{login}/mcp-demo/issues/{created_issue['number']}")
     check(fetched_issue["id"] == created_issue["id"] and fetched_issue["title"] == "from mcp", "mcp issue id stable")
 
-    # Keep-alive: two responses on one socket.
+    # Two tools/call requests in flight keep their own ids.
+    barrier = threading.Barrier(2)
+    results = {}
+
+    def fire(call_id, title):
+        barrier.wait()
+        status_code, payload, _hdr = client.json("POST", "/mcp", {
+            "jsonrpc": "2.0",
+            "id": call_id,
+            "method": "tools/call",
+            "params": {"name": "create_issue", "arguments": {"full_name": f"{login}/mcp-demo", "title": title}},
+        })
+        results[call_id] = (status_code, payload)
+
+    threads = [
+        threading.Thread(target=fire, args=(11, "left")),
+        threading.Thread(target=fire, args=(22, "right")),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    check(results[11][1]["id"] == 11 and results[22][1]["id"] == 22, f"concurrent ids {results}")
+    left = json.loads(results[11][1]["result"]["content"][0]["text"])
+    right = json.loads(results[22][1]["result"]["content"][0]["text"])
+    check(left["title"] == "left" and right["title"] == "right" and left["id"] != right["id"], "concurrent arguments")
+
     sock = socket.create_connection(("127.0.0.1", port))
     req = (
         f"GET /api/v3/repos/{login}/mcp-demo/issues/{created_issue['number']} HTTP/1.1\r\n"
