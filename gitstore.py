@@ -1,17 +1,18 @@
 """Git object database and smart HTTP (upload-pack v2, receive-pack v0).
 
-Objects and packfiles are implemented with hashlib and zlib. No git binary.
-Protocol shapes match git 2.43: v2 advertisements open with "version 2",
-receive-pack keeps the "# service=git-receive-pack" preamble, and a
-report-status payload is pkt-lines wrapped in side-band-64k.
+Objects and packfiles are built with hashlib and zlib. No git binary.
+Protocol shapes match git's smart HTTP: a v2 advertisement opens with
+"version 2", receive-pack keeps the "# service=git-receive-pack" preamble,
+and a report-status payload is pkt-lines wrapped in side-band-64k.
 """
 
 from __future__ import annotations
 
 import hashlib
+import struct
 import threading
 import zlib
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, unquote
 
 ZERO = "0" * 40
 JSON = "application/json; charset=utf-8"
@@ -23,6 +24,8 @@ UPLOAD_AD = "application/x-git-upload-pack-advertisement"
 RECEIVE_AD = "application/x-git-receive-pack-advertisement"
 UPLOAD_RESULT = "application/x-git-upload-pack-result"
 RECEIVE_RESULT = "application/x-git-receive-pack-result"
+NO_CACHE = (("Cache-Control", "no-cache"),)
+_PACK = struct.Struct(">4sII")
 
 
 def sha1(*parts: bytes) -> bytes:
@@ -43,19 +46,24 @@ def pkt(data: bytes | str) -> bytes:
 
 
 def sideband(data: bytes, band: int = 1, limit: int = 65515) -> bytes:
+    """Wrap bytes as side-band pkt-lines. limit keeps each pkt at or under 65520."""
     if not data:
         return b""
     out = bytearray()
-    prefix = bytes((band,))
+    band_byte = bytes((band,))
     view = memoryview(data)
-    for offset in range(0, len(view), limit):
-        chunk = prefix + view[offset : offset + limit].tobytes()
+    offset = 0
+    total = len(view)
+    while offset < total:
+        take = limit if total - offset > limit else total - offset
+        chunk = band_byte + view[offset : offset + take].tobytes()
         out += f"{len(chunk) + 4:04x}".encode()
         out += chunk
+        offset += take
     return bytes(out)
 
 
-def read_varint(data: bytes, index: int) -> tuple[int, int]:
+def read_varint(data: bytes | memoryview, index: int) -> tuple[int, int]:
     value = 0
     shift = 0
     while True:
@@ -67,7 +75,7 @@ def read_varint(data: bytes, index: int) -> tuple[int, int]:
         shift += 7
 
 
-def read_ofs(data: bytes, index: int) -> tuple[int, int]:
+def read_ofs(data: bytes | memoryview, index: int) -> tuple[int, int]:
     byte = data[index]
     index += 1
     offset = byte & 0x7F
@@ -85,7 +93,8 @@ def apply_delta(base: bytes, delta: bytes) -> bytes:
     if source_size != len(base):
         raise ValueError("delta base size mismatch")
     out = bytearray()
-    while index < len(delta):
+    delta_len = len(delta)
+    while index < delta_len:
         cmd = delta[index]
         index += 1
         if cmd == 0:
@@ -125,23 +134,28 @@ def apply_delta(base: bytes, delta: bytes) -> bytes:
     return bytes(out)
 
 
+def _object_header(type_id: int, size: int) -> bytes:
+    first = (type_id << 4) | (size & 0x0F)
+    size >>= 4
+    if not size:
+        return bytes((first,))
+    header = bytearray()
+    while size:
+        header.append(first | 0x80)
+        first = size & 0x7F
+        size >>= 7
+    header.append(first)
+    return bytes(header)
+
+
 def build_pack(objects: list[tuple[str, bytes]]) -> bytes:
-    parts = [b"PACK", (2).to_bytes(4, "big"), len(objects).to_bytes(4, "big")]
+    out = bytearray()
+    out += _PACK.pack(b"PACK", 2, len(objects))
     for typ, content in objects:
-        size = len(content)
-        type_id = TYPEID[typ]
-        first = (type_id << 4) | (size & 0x0F)
-        size >>= 4
-        header = bytearray()
-        while size:
-            header.append(first | 0x80)
-            first = size & 0x7F
-            size >>= 7
-        header.append(first)
-        parts.append(bytes(header))
-        parts.append(zlib.compress(content, 1))
-    data = b"".join(parts)
-    return data + sha1(data)
+        out += _object_header(TYPEID[typ], len(content))
+        out += zlib.compress(content, 1)
+    out += sha1(out)
+    return bytes(out)
 
 
 def parse_pack(data: bytes, lookup) -> list[tuple[str, bytes]]:
@@ -151,8 +165,8 @@ def parse_pack(data: bytes, lookup) -> list[tuple[str, bytes]]:
     if version not in (2, 3):
         raise ValueError(f"unsupported pack version {version}")
     count = int.from_bytes(data[8:12], "big")
-    body, checksum = data[:-20], data[-20:]
-    if sha1(body) != checksum:
+    body = memoryview(data)[:-20]
+    if sha1(data[:-20]) != data[-20:]:
         raise ValueError("pack checksum mismatch")
     entries = []
     index = 12
@@ -176,7 +190,9 @@ def parse_pack(data: bytes, lookup) -> list[tuple[str, bytes]]:
         base_sha = None
         base_ofs = None
         if typ == 7:
-            base_sha = body[index : index + 20].hex()
+            if index + 20 > body_len:
+                raise ValueError("truncated ref delta")
+            base_sha = bytes(body[index : index + 20]).hex()
             index += 20
         elif typ == 6:
             relative, index = read_ofs(body, index)
@@ -187,7 +203,8 @@ def parse_pack(data: bytes, lookup) -> list[tuple[str, bytes]]:
         inflated = inflater.decompress(body[index:])
         if not inflater.eof:
             raise ValueError("incomplete zlib stream")
-        index = body_len - len(inflater.unused_data)
+        unused = inflater.unused_data
+        index = body_len - len(unused)
         if len(inflated) != size:
             raise ValueError("object size mismatch")
         entries.append((start, typ, inflated, base_sha, base_ofs))
@@ -247,6 +264,34 @@ def parse_commit(content: bytes) -> tuple[str, list[str]]:
     return tree, parents
 
 
+def parse_commit_full(content: bytes) -> dict:
+    tree = ""
+    parents: list[str] = []
+    author = ""
+    committer = ""
+    lines = content.split(b"\n")
+    message = ""
+    for index, line in enumerate(lines):
+        if line == b"":
+            message = b"\n".join(lines[index + 1 :]).decode("utf-8", "replace")
+            break
+        if line.startswith(b"tree "):
+            tree = line[5:].decode()
+        elif line.startswith(b"parent "):
+            parents.append(line[7:].decode())
+        elif line.startswith(b"author "):
+            author = line[7:].decode("utf-8", "replace")
+        elif line.startswith(b"committer "):
+            committer = line[10:].decode("utf-8", "replace")
+    return {
+        "tree": tree,
+        "parents": parents,
+        "author": author,
+        "committer": committer,
+        "message": message,
+    }
+
+
 def parse_tree(content: bytes) -> list[tuple[str, str, str]]:
     entries = []
     index = 0
@@ -280,10 +325,13 @@ def encode_tree(entries: list[tuple[str, str, str]]) -> bytes:
 
 
 def iso_to_unix(iso: str) -> int:
-    from datetime import datetime
+    from datetime import datetime, timezone
 
-    text = iso[:-1] + "+00:00" if iso.endswith("Z") else iso
-    return int(datetime.fromisoformat(text).timestamp())
+    text = iso[:-1] + "+00:00" if iso.endswith(("Z", "z")) else iso
+    moment = datetime.fromisoformat(text)
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    return int(moment.timestamp())
 
 
 class PutResult:
@@ -306,8 +354,14 @@ class GitRepo:
         self.parents: dict[str, tuple[str, ...]] = {}
         self.commit_tree: dict[str, str] = {}
         self.lock = threading.RLock()
-        self.pack_cache: dict[tuple, tuple[bytes, list[str]]] = {}
+        # Framed upload-pack bodies keyed by the wants. Content-addressed, so a
+        # push only has to drop the dict; identical shallow clones share one pack.
+        self.resp_cache: dict[tuple, bytes] = {}
         self.inflight: dict[tuple, threading.Event] = {}
+
+    def _bump(self) -> None:
+        self.resp_cache.clear()
+        self.inflight.clear()
 
     def add_object(self, typ: str, content: bytes) -> str:
         oid = object_id(typ, content)
@@ -320,8 +374,7 @@ class GitRepo:
         return oid
 
     def lookup(self, oid: str):
-        pair = self.objects.get(oid)
-        return pair
+        return self.objects.get(oid)
 
     def branch_sha(self, branch: str) -> str | None:
         return self.refs.get(f"refs/heads/{branch}")
@@ -331,6 +384,7 @@ class GitRepo:
             return True
         stack = [descendant]
         seen: set[str] = set()
+        parents = self.parents
         while stack:
             sha = stack.pop()
             if sha == ancestor:
@@ -338,28 +392,31 @@ class GitRepo:
             if sha in seen:
                 continue
             seen.add(sha)
-            stack.extend(self.parents.get(sha, ()))
+            stack.extend(parents.get(sha, ()))
         return False
 
     def merge_base(self, left: str, right: str) -> str | None:
         ancestors: set[str] = set()
         stack = [left]
+        parents = self.parents
         while stack:
             sha = stack.pop()
             if sha in ancestors:
                 continue
             ancestors.add(sha)
-            stack.extend(self.parents.get(sha, ()))
+            stack.extend(parents.get(sha, ()))
         queue = [right]
         seen: set[str] = set()
-        while queue:
-            sha = queue.pop(0)
+        head = 0
+        while head < len(queue):
+            sha = queue[head]
+            head += 1
             if sha in seen:
                 continue
             seen.add(sha)
             if sha in ancestors:
                 return sha
-            queue.extend(self.parents.get(sha, ()))
+            queue.extend(parents.get(sha, ()))
         return None
 
     def write_tree(self, entries: list[tuple[str, str, str]]) -> str:
@@ -370,11 +427,12 @@ class GitRepo:
             return None
         node = tree_sha
         kind = "tree"
+        objects = self.objects
         for depth, name in enumerate(parts):
             if kind != "tree":
                 return None
             found = None
-            for mode, entry_name, sha in parse_tree(self.objects[node][1]):
+            for mode, entry_name, sha in parse_tree(objects[node][1]):
                 if entry_name == name:
                     found = (mode, sha)
                     break
@@ -453,8 +511,7 @@ class GitRepo:
         lines = [f"tree {tree}\n"]
         lines.extend(f"parent {parent}\n" for parent in parents)
         lines.append(f"author {ident}\n")
-        lines.append(f"committer {ident}\n")
-        lines.append("\n")
+        lines.append(f"committer {ident}\n\n")
         content = "".join(lines).encode() + message.encode()
         return self.add_object("commit", content)
 
@@ -503,6 +560,7 @@ class GitRepo:
             parents = [parent] if parent else []
             commit = self.make_commit(new_tree, parents, message, name, email, when_iso)
             self.refs[ref] = commit
+            self._bump()
             return PutResult("created" if created else "updated", commit, blob, new_tree, parents, message)
 
     def delete_file(
@@ -534,10 +592,11 @@ class GitRepo:
                 new_tree = self.write_tree([])
             commit = self.make_commit(new_tree, [parent], message, name, email, when_iso)
             self.refs[ref] = commit
+            self._bump()
             return PutResult("deleted", commit, None, new_tree, [parent], message)
 
     def merged_tree(self, base_sha: str, head_sha: str) -> str | None:
-        """Return the squash tree, or None when the branches conflict."""
+        """Squash tree of base and head, or None when the two sides conflict."""
         if self.is_ancestor(base_sha, head_sha):
             return self.commit_tree.get(head_sha)
         if self.is_ancestor(head_sha, base_sha):
@@ -591,16 +650,25 @@ class GitRepo:
                 return None
             commit = self.make_commit(tree, [base_sha], message, name, email, when_iso)
             self.refs[f"refs/heads/{base_branch}"] = commit
+            self._bump()
             return commit
 
-    def _tree_from_flat(self, flat: dict[str, tuple[str, str]]) -> str:
+    def _tree_from_flat(self, flat: dict[str, tuple[str, str]]) -> str | None:
         root: dict = {}
-        for path, (mode, sha) in flat.items():
+        for path, entry in flat.items():
             node = root
             parts = path.split("/")
             for name in parts[:-1]:
-                node = node.setdefault(name, {})
-            node[parts[-1]] = (mode, sha)
+                child = node.get(name)
+                if child is None:
+                    child = {}
+                    node[name] = child
+                elif not isinstance(child, dict):
+                    return None
+                node = child
+            if isinstance(node.get(parts[-1]), dict):
+                return None
+            node[parts[-1]] = entry
 
         def build(node: dict) -> str:
             entries = []
@@ -611,7 +679,7 @@ class GitRepo:
                     entries.append((value[0], name, value[1]))
             return self.write_tree(entries)
 
-        return build(root)
+        return build(root) if root else self.write_tree([])
 
     def diff(self, base_sha: str | None, head_sha: str | None) -> list[dict]:
         with self.lock:
@@ -624,6 +692,7 @@ class GitRepo:
             before = self.flatten(base_tree)
             after = self.flatten(head_tree)
         files = []
+        objects = self.objects
         for path in sorted(set(before) | set(after)):
             left = before.get(path)
             right = after.get(path)
@@ -631,13 +700,13 @@ class GitRepo:
                 continue
             if left is None:
                 status = "added"
-                additions, deletions = _line_count(self.objects[right[1]][1]), 0
+                additions, deletions = _line_count(objects[right[1]][1]), 0
             elif right is None:
                 status = "removed"
-                additions, deletions = 0, _line_count(self.objects[left[1]][1])
+                additions, deletions = 0, _line_count(objects[left[1]][1])
             else:
                 status = "modified"
-                additions, deletions = _line_diff(self.objects[left[1]][1], self.objects[right[1]][1])
+                additions, deletions = _line_diff(objects[left[1]][1], objects[right[1]][1])
             files.append({
                 "path": path,
                 "status": status,
@@ -650,12 +719,13 @@ class GitRepo:
     def ahead(self, base_sha: str, head_sha: str) -> int:
         ancestors: set[str] = set()
         stack = [base_sha]
+        parents = self.parents
         while stack:
             sha = stack.pop()
             if sha in ancestors:
                 continue
             ancestors.add(sha)
-            stack.extend(self.parents.get(sha, ()))
+            stack.extend(parents.get(sha, ()))
         count = 0
         stack = [head_sha]
         seen: set[str] = set()
@@ -665,20 +735,33 @@ class GitRepo:
                 continue
             seen.add(sha)
             count += 1
-            stack.extend(self.parents.get(sha, ()))
+            stack.extend(parents.get(sha, ()))
         return count
+
+    def history(self, sha: str | None, limit: int) -> list[str]:
+        """First-parent walk, tip first. Used by the commits REST route."""
+        out = []
+        seen: set[str] = set()
+        current = sha
+        while current and current not in seen and len(out) < limit:
+            seen.add(current)
+            if current not in self.objects:
+                break
+            out.append(current)
+            parents = self.parents.get(current, ())
+            current = parents[0] if parents else None
+        return out
 
     def advertise_upload(self, version2: bool) -> bytes:
         if version2:
-            lines = [
+            return b"".join((
                 pkt("version 2\n"),
                 pkt(f"{AGENT}\n"),
                 pkt("ls-refs=unborn\n"),
                 pkt("fetch=shallow\n"),
                 pkt("object-format=sha1\n"),
                 b"0000",
-            ]
-            return b"".join(lines)
+            ))
         with self.lock:
             head = self.refs.get(self.head_target)
             caps = (
@@ -706,7 +789,10 @@ class GitRepo:
 
     def advertise_receive(self) -> bytes:
         with self.lock:
-            caps = f"report-status report-status-v2 delete-refs side-band-64k ofs-delta quiet object-format=sha1 {AGENT}"
+            caps = (
+                f"report-status report-status-v2 delete-refs side-band-64k "
+                f"ofs-delta quiet object-format=sha1 {AGENT}"
+            )
             body = [pkt("# service=git-receive-pack\n"), b"0000"]
             if not self.refs:
                 body.append(pkt(f"{ZERO} capabilities^{{}}\0{caps}\n"))
@@ -786,14 +872,19 @@ class GitRepo:
         return oid
 
     def _fetch_v2(self, args: list[str]) -> bytes:
-        wants = []
+        wants: list[str] = []
+        haves: list[str] = []
         depth = None
         include_tag = False
+        seen_want: set[str] = set()
         for arg in args:
             if arg.startswith("want "):
                 oid = arg.split()[1]
-                if oid not in wants:
+                if oid not in seen_want:
+                    seen_want.add(oid)
                     wants.append(oid)
+            elif arg.startswith("have "):
+                haves.append(arg.split()[1])
             elif arg.startswith("deepen "):
                 try:
                     depth = int(arg.split()[1])
@@ -801,43 +892,53 @@ class GitRepo:
                     depth = 1
             elif arg == "include-tag":
                 include_tag = True
-        pack, shallow = self.pack_for(wants, depth, include_tag)
+        key = (tuple(wants), tuple(haves), -1 if depth is None else depth, include_tag, 2)
+        pack_body = self._cached(key, lambda: self._frame_v2(wants, haves, depth, include_tag))
+        return pack_body
+
+    def _frame_v2(self, wants: list[str], haves: list[str], depth: int | None, include_tag: bool) -> bytes:
+        pack, shallow = self._collect(wants, haves, depth, include_tag)
+        framed = build_pack(pack)
         chunks = []
-        if shallow:
+        if depth is not None and shallow:
             chunks.append(pkt("shallow-info\n"))
             for oid in shallow:
                 chunks.append(pkt(f"shallow {oid}\n"))
             chunks.append(b"0001")
         chunks.append(pkt("packfile\n"))
-        chunks.append(sideband(pack))
+        chunks.append(sideband(framed))
         chunks.append(b"0000")
         return b"".join(chunks)
 
     def _upload_v0(self, body: bytes) -> bytes:
-        wants, depth, done, include_tag = _parse_v0(body)
+        wants, haves, depth, done, include_tag = _parse_v0(body)
         if not done:
-            _pack, shallow = self.pack_for(wants, depth, include_tag) if wants else (b"", [])
+            _pack, shallow = self._collect(wants, haves, depth, include_tag) if wants else ([], [])
             out = bytearray()
             for oid in shallow:
                 out += pkt(f"shallow {oid}\n")
+            out += pkt("NAK\n")
             out += b"0000"
             return bytes(out)
-        pack, shallow = self.pack_for(wants, depth, include_tag)
+        key = (tuple(wants), tuple(haves), -1 if depth is None else depth, include_tag, 0)
+        return self._cached(key, lambda: self._frame_v0(wants, haves, depth, include_tag))
+
+    def _frame_v0(self, wants, haves, depth, include_tag) -> bytes:
+        pack, shallow = self._collect(wants, haves, depth, include_tag)
+        framed = build_pack(pack)
         out = bytearray()
-        # deepen asks for a shallow section even when the tip is a root commit.
         if depth is not None:
             for oid in shallow:
                 out += pkt(f"shallow {oid}\n")
             out += b"0000"
         out += pkt("NAK\n")
-        out += sideband(pack)
+        out += sideband(framed)
         out += b"0000"
         return bytes(out)
 
-    def pack_for(self, wants: list[str], depth: int | None, include_tag: bool) -> tuple[bytes, list[str]]:
-        key = (tuple(wants), -1 if depth is None else depth, include_tag)
+    def _cached(self, key: tuple, build) -> bytes:
         with self.lock:
-            cached = self.pack_cache.get(key)
+            cached = self.resp_cache.get(key)
             if cached is not None:
                 return cached
             event = self.inflight.get(key)
@@ -850,32 +951,51 @@ class GitRepo:
         if not leader:
             event.wait()
             with self.lock:
-                cached = self.pack_cache.get(key)
+                cached = self.resp_cache.get(key)
             if cached is not None:
                 return cached
         try:
-            objects, shallow = self._collect(wants, depth, include_tag)
-            pack = build_pack(objects)
+            body = build()
             with self.lock:
-                self.pack_cache[key] = (pack, shallow)
-            return pack, shallow
+                # A push clears the cache and the inflight map. Only publish
+                # when this build is still the one waiters are blocked on.
+                if self.inflight.get(key) is event:
+                    self.resp_cache[key] = body
+            return body
         finally:
             with self.lock:
-                self.inflight.pop(key, None)
+                if self.inflight.get(key) is event:
+                    self.inflight.pop(key, None)
             event.set()
 
-    def _collect(self, wants: list[str], depth: int | None, include_tag: bool) -> tuple[list[tuple[str, bytes]], list[str]]:
+    def _collect(
+        self,
+        wants: list[str],
+        haves: list[str],
+        depth: int | None,
+        include_tag: bool,
+    ) -> tuple[list[tuple[str, bytes]], list[str]]:
         with self.lock:
+            have_set: set[str] = set()
+            stack = [oid for oid in haves if oid in self.objects]
+            while stack:
+                oid = stack.pop()
+                if oid in have_set:
+                    continue
+                have_set.add(oid)
+                stack.extend(self.parents.get(oid, ()))
             selected: list[str] = []
             shallow: list[str] = []
             seen: set[str] = set()
             queue: list[tuple[str, int]] = []
             for oid in wants:
-                if oid in self.objects:
+                if oid in self.objects and oid not in have_set:
                     queue.append((oid, 1))
-            while queue:
-                oid, level = queue.pop(0)
-                if oid in seen or oid not in self.objects:
+            head = 0
+            while head < len(queue):
+                oid, level = queue[head]
+                head += 1
+                if oid in seen or oid not in self.objects or oid in have_set:
                     continue
                 seen.add(oid)
                 if self.objects[oid][0] != "commit":
@@ -884,16 +1004,17 @@ class GitRepo:
                 selected.append(oid)
                 parents = self.parents.get(oid, ())
                 if depth is not None and level >= depth:
-                    if parents:
+                    if any(parent not in have_set for parent in parents):
                         shallow.append(oid)
                     continue
                 for parent in parents:
-                    queue.append((parent, level + 1))
+                    if parent not in have_set:
+                        queue.append((parent, level + 1))
             objects: list[tuple[str, bytes]] = []
             added: set[str] = set()
 
             def add_sha(oid: str) -> None:
-                if oid in added or oid not in self.objects:
+                if oid in added or oid not in self.objects or oid in have_set and self.objects[oid][0] == "commit":
                     return
                 added.add(oid)
                 typ, content = self.objects[oid]
@@ -923,7 +1044,7 @@ class GitRepo:
             for oid in selected:
                 add_sha(oid)
             if include_tag:
-                for oid in list(self.refs.values()):
+                for oid in self.refs.values():
                     pair = self.objects.get(oid)
                     if pair and pair[0] == "tag":
                         peeled = self._peel(oid)
@@ -945,26 +1066,26 @@ class GitRepo:
             with self.lock:
                 for typ, content in objects:
                     self.add_object(typ, content)
-                for _old, new, ref in commands:
+                for old, new, ref in commands:
                     if new != ZERO and new not in self.objects:
                         results.append((ref, "missing necessary objects"))
                         continue
                     current = self.refs.get(ref)
                     if new == ZERO:
-                        if current is None or (_old != ZERO and current != _old):
+                        if current is None or (old != ZERO and current != old):
                             results.append((ref, "failed to lock"))
                             continue
                         self.refs.pop(ref, None)
                         results.append((ref, None))
                         continue
                     if current is None:
-                        if _old != ZERO:
+                        if old != ZERO:
                             results.append((ref, "failed to lock"))
                             continue
                         self.refs[ref] = new
                         results.append((ref, None))
                         continue
-                    if current != _old:
+                    if current != old:
                         results.append((ref, "failed to lock"))
                         continue
                     if new != current and not self.is_ancestor(current, new):
@@ -972,6 +1093,7 @@ class GitRepo:
                         continue
                     self.refs[ref] = new
                     results.append((ref, None))
+                self._bump()
         want_report = "report-status" in caps or "report-status-v2" in caps or not caps
         if not want_report:
             return b""
@@ -981,10 +1103,7 @@ class GitRepo:
                 lines.append(f"ng {ref} unpacker error\n")
         else:
             for ref, error in results:
-                if error:
-                    lines.append(f"ng {ref} {error}\n")
-                else:
-                    lines.append(f"ok {ref}\n")
+                lines.append(f"ng {ref} {error}\n" if error else f"ok {ref}\n")
         report = b"".join(pkt(line) for line in lines) + b"0000"
         if "side-band-64k" in caps or not caps:
             return sideband(report, 1, 65515) + b"0000"
@@ -1000,7 +1119,10 @@ def _v2_command(body: bytes) -> tuple[str, list[str]]:
     index = 0
     length = len(body)
     while index + 4 <= length:
-        size = int(body[index : index + 4], 16)
+        try:
+            size = int(body[index : index + 4], 16)
+        except ValueError:
+            break
         if size == 0:
             break
         if size == 1:
@@ -1014,23 +1136,25 @@ def _v2_command(body: bytes) -> tuple[str, list[str]]:
         if not seen_delim:
             if line.startswith("command="):
                 command = line.split("=", 1)[1].split()[0]
-            elif command == "" and "command=" in line:
-                command = line.split("command=", 1)[1].split()[0]
         else:
             if line:
                 args.append(line)
     return command, args
 
 
-def _parse_v0(body: bytes) -> tuple[list[str], int | None, bool, bool]:
+def _parse_v0(body: bytes) -> tuple[list[str], list[str], int | None, bool, bool]:
     wants: list[str] = []
+    haves: list[str] = []
     depth = None
     done = False
     include_tag = False
     index = 0
     length = len(body)
     while index + 4 <= length:
-        size = int(body[index : index + 4], 16)
+        try:
+            size = int(body[index : index + 4], 16)
+        except ValueError:
+            break
         if size == 0:
             index += 4
             continue
@@ -1044,6 +1168,10 @@ def _parse_v0(body: bytes) -> tuple[list[str], int | None, bool, bool]:
                 wants.append(parts[1])
             if "include-tag" in parts:
                 include_tag = True
+        elif line.startswith("have "):
+            parts = line.split()
+            if len(parts) >= 2:
+                haves.append(parts[1])
         elif line.startswith("deepen "):
             try:
                 depth = int(line.split()[1])
@@ -1051,7 +1179,7 @@ def _parse_v0(body: bytes) -> tuple[list[str], int | None, bool, bool]:
                 depth = 1
         elif line == "done":
             done = True
-    return wants, depth, done, include_tag
+    return wants, haves, depth, done, include_tag
 
 
 def _parse_receive(body: bytes) -> tuple[list[tuple[str, str, str]], set[str], bytes]:
@@ -1060,7 +1188,10 @@ def _parse_receive(body: bytes) -> tuple[list[tuple[str, str, str]], set[str], b
     index = 0
     length = len(body)
     while index + 4 <= length:
-        size = int(body[index : index + 4], 16)
+        try:
+            size = int(body[index : index + 4], 16)
+        except ValueError:
+            break
         if size == 0:
             index += 4
             break
@@ -1073,55 +1204,57 @@ def _parse_receive(body: bytes) -> tuple[list[tuple[str, str, str]], set[str], b
         if b"\0" in raw:
             raw, cap_bytes = raw.split(b"\0", 1)
             caps.update(token for token in cap_bytes.decode().split() if token)
-        text = raw.decode()
-        parts = text.split()
+        parts = raw.decode().split()
         if len(parts) < 3:
             continue
         commands.append((parts[0], parts[1], parts[2]))
     pack = body[index:]
     if pack.startswith(b"0000"):
         pack = pack[4:]
-    if pack and not pack.startswith(b"PACK"):
-        # A trailing flush with no pack is fine; anything else is an error at unpack.
-        if pack.strip(b"\x00"):
-            pass
-        else:
-            pack = b""
-    if pack and not pack.startswith(b"PACK"):
+    if not pack.startswith(b"PACK"):
         pack = b""
     return commands, caps, pack
 
 
 def ensure_git(repo, store) -> GitRepo:
-    with repo.lock:
-        git = repo.git
-        if git is None:
-            git = GitRepo(repo.default_branch)
-            repo.git = git
-            if repo.auto_init:
-                git.put_file(
-                    repo.default_branch,
-                    "README.md",
-                    f"# {repo.name}\n".encode(),
-                    "Initial commit",
-                    store.login,
-                    f"{store.login}@users.noreply.github.com",
-                    store.now,
-                    None,
-                )
-        git.head_target = f"refs/heads/{repo.default_branch}"
-        return git
+    git = repo.git
+    if git is None:
+        with repo.lock:
+            git = repo.git
+            if git is None:
+                git = GitRepo(repo.default_branch)
+                repo.git = git
+                init = repo.auto_init
+            else:
+                init = False
+        if init:
+            git.put_file(
+                repo.default_branch,
+                "README.md",
+                f"# {repo.name}\n".encode(),
+                "Initial commit",
+                store.login,
+                f"{store.login}@users.noreply.github.com",
+                store.now,
+                None,
+            )
+    git.head_target = f"refs/heads/{repo.default_branch}"
+    return git
 
 
 def parse_git_path(path: str) -> tuple[str, str, str] | None:
+    if not path.startswith("/") or path.startswith("/api/"):
+        return None
     parts = path.split("/")
-    if len(parts) < 3 or path.startswith("/api/"):
+    if len(parts) < 3:
         return None
     repo_part = parts[2]
     if not repo_part.endswith(".git"):
         return None
-    owner = parts[1]
-    name = repo_part[: -len(".git")]
+    owner = unquote(parts[1])
+    name = unquote(repo_part[: -len(".git")])
+    if not owner or not name:
+        return None
     rest = "/".join(parts[3:])
     return owner, name, rest
 
@@ -1140,17 +1273,16 @@ def handle_git(method: str, path: str, raw_query: str, body: bytes, protocol: st
     if repo is None:
         return 404, NOT_FOUND, JSON, ()
     git = ensure_git(repo, store)
-    extra = (("Cache-Control", "no-cache"),)
     if method == "GET" and rest == "info/refs":
         if service == "git-upload-pack":
-            return 200, git.advertise_upload(version2), UPLOAD_AD, extra
+            return 200, git.advertise_upload(version2), UPLOAD_AD, NO_CACHE
         if service == "git-receive-pack":
-            return 200, git.advertise_receive(), RECEIVE_AD, extra
+            return 200, git.advertise_receive(), RECEIVE_AD, NO_CACHE
         return 404, NOT_FOUND, JSON, ()
     if method == "POST" and rest == "git-upload-pack":
-        return 200, git.upload_pack(body, version2), UPLOAD_RESULT, extra
+        return 200, git.upload_pack(body, version2), UPLOAD_RESULT, NO_CACHE
     if method == "POST" and rest == "git-receive-pack":
-        return 200, git.receive_pack(body), RECEIVE_RESULT, extra
+        return 200, git.receive_pack(body), RECEIVE_RESULT, NO_CACHE
     return 404, NOT_FOUND, JSON, ()
 
 

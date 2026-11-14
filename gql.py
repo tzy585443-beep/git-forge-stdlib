@@ -1,8 +1,9 @@
 """GraphQL endpoint for the documents gh and github-mcp-server send.
 
 Introspection describes Issue, PullRequest, Repository, and SearchType.
-repository.issues honors states and orderBy, and createPullRequest opens a
-pull request on a branch that was pushed over git.
+repository.issues honors states and orderBy. createPullRequest opens a pull
+request on a branch that was pushed over git. A body that holds two operation
+documents answers two results, in order.
 """
 
 from __future__ import annotations
@@ -10,6 +11,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 
+import gitstore
 from store import get_store, node_id, parse_node_id
 
 JSON = "application/json; charset=utf-8"
@@ -19,12 +21,13 @@ def dumps(obj: object) -> bytes:
     return json.dumps(obj, separators=(",", ":")).encode()
 
 
-# field name -> (type string, arguments)
+# field -> (type, arguments)
 SCHEMA: dict[str, dict[str, tuple[str, dict]]] = {
     "Query": {
         "repository": ("Repository", {"owner": "String!", "name": "String!"}),
         "node": ("Node", {"id": "ID!"}),
         "viewer": ("User", {}),
+        "search": ("SearchResultItemConnection!", {"query": "String!", "type": "SearchType!", "first": "Int", "after": "String"}),
         "__type": ("__Type", {"name": "String!"}),
         "__schema": ("__Schema", {}),
     },
@@ -38,17 +41,30 @@ SCHEMA: dict[str, dict[str, tuple[str, dict]]] = {
         "nameWithOwner": ("String!", {}),
         "owner": ("RepositoryOwner!", {}),
         "description": ("String", {}),
-        "url": ("String", {}),
+        "url": ("URI", {}),
         "isPrivate": ("Boolean!", {}),
         "defaultBranchRef": ("Ref", {}),
         "viewerPermission": ("RepositoryPermission", {}),
         "hasIssuesEnabled": ("Boolean!", {}),
         "issue": ("Issue", {"number": "Int!"}),
-        "issues": ("IssueConnection!", {"first": "Int", "after": "String", "states": "[IssueState!]", "orderBy": "IssueOrder", "labels": "[String!]"}),
+        "issues": ("IssueConnection!", {
+            "first": "Int",
+            "after": "String",
+            "states": "[IssueState!]",
+            "orderBy": "IssueOrder",
+            "labels": "[String!]",
+            "filterBy": "IssueFilters",
+        }),
         "pullRequest": ("PullRequest", {"number": "Int!"}),
-        "pullRequests": ("PullRequestConnection!", {"first": "Int", "states": "[PullRequestState!]", "orderBy": "IssueOrder", "headRefName": "String", "baseRefName": "String"}),
-        "createdAt": ("String", {}),
-        "updatedAt": ("String", {}),
+        "pullRequests": ("PullRequestConnection!", {
+            "first": "Int",
+            "states": "[PullRequestState!]",
+            "orderBy": "IssueOrder",
+            "headRefName": "String",
+            "baseRefName": "String",
+        }),
+        "createdAt": ("DateTime", {}),
+        "updatedAt": ("DateTime", {}),
     },
     "Issue": {
         "id": ("ID!", {}),
@@ -56,15 +72,15 @@ SCHEMA: dict[str, dict[str, tuple[str, dict]]] = {
         "title": ("String!", {}),
         "state": ("IssueState!", {}),
         "body": ("String", {}),
-        "url": ("String", {}),
+        "url": ("URI", {}),
         "author": ("User", {}),
-        "createdAt": ("String", {}),
-        "updatedAt": ("String", {}),
+        "createdAt": ("DateTime", {}),
+        "updatedAt": ("DateTime", {}),
         "closed": ("Boolean!", {}),
-        "closedAt": ("String", {}),
+        "closedAt": ("DateTime", {}),
         "repository": ("Repository", {}),
         "labels": ("LabelConnection", {"first": "Int"}),
-        "comments": ("IssueCommentConnection", {}),
+        "comments": ("IssueCommentConnection", {"first": "Int"}),
     },
     "PullRequest": {
         "id": ("ID!", {}),
@@ -76,25 +92,25 @@ SCHEMA: dict[str, dict[str, tuple[str, dict]]] = {
         "mergeable": ("MergeableState!", {}),
         "headRefName": ("String!", {}),
         "baseRefName": ("String!", {}),
-        "headRefOid": ("String", {}),
-        "baseRefOid": ("String", {}),
-        "url": ("String", {}),
+        "headRefOid": ("GitObjectID", {}),
+        "baseRefOid": ("GitObjectID", {}),
+        "url": ("URI", {}),
         "files": ("PullRequestChangedFileConnection", {"first": "Int"}),
         "additions": ("Int!", {}),
         "deletions": ("Int!", {}),
         "changedFiles": ("Int!", {}),
         "author": ("User", {}),
-        "createdAt": ("String", {}),
-        "updatedAt": ("String", {}),
+        "createdAt": ("DateTime", {}),
+        "updatedAt": ("DateTime", {}),
         "closed": ("Boolean!", {}),
-        "closedAt": ("String", {}),
+        "closedAt": ("DateTime", {}),
     },
     "User": {
         "id": ("ID!", {}),
         "login": ("String!", {}),
         "name": ("String", {}),
-        "url": ("String", {}),
-        "avatarUrl": ("String", {}),
+        "url": ("URI", {}),
+        "avatarUrl": ("URI", {}),
     },
     "RepositoryOwner": {
         "id": ("ID!", {}),
@@ -106,11 +122,11 @@ SCHEMA: dict[str, dict[str, tuple[str, dict]]] = {
         "target": ("GitObject", {}),
     },
     "GitObject": {
-        "oid": ("String", {}),
+        "oid": ("GitObjectID", {}),
         "abbreviatedOid": ("String", {}),
     },
     "Commit": {
-        "oid": ("String", {}),
+        "oid": ("GitObjectID", {}),
         "message": ("String", {}),
         "abbreviatedOid": ("String", {}),
     },
@@ -147,8 +163,12 @@ SCHEMA: dict[str, dict[str, tuple[str, dict]]] = {
         "pageInfo": ("PageInfo!", {}),
     },
     "Label": {"id": ("ID!", {}), "name": ("String!", {}), "color": ("String", {}), "description": ("String", {})},
-    "IssueCommentConnection": {"totalCount": ("Int!", {}), "nodes": ("[IssueComment]", {}), "pageInfo": ("PageInfo!", {})},
-    "IssueComment": {"id": ("ID", {}), "body": ("String", {})},
+    "IssueCommentConnection": {
+        "totalCount": ("Int!", {}),
+        "nodes": ("[IssueComment]", {}),
+        "pageInfo": ("PageInfo!", {}),
+    },
+    "IssueComment": {"id": ("ID", {}), "body": ("String", {}), "author": ("User", {})},
     "PageInfo": {
         "hasNextPage": ("Boolean!", {}),
         "hasPreviousPage": ("Boolean!", {}),
@@ -159,6 +179,15 @@ SCHEMA: dict[str, dict[str, tuple[str, dict]]] = {
         "pullRequest": ("PullRequest", {}),
         "clientMutationId": ("String", {}),
     },
+    "SearchResultItemConnection": {
+        "nodes": ("[SearchResultItem]", {}),
+        "edges": ("[SearchResultItemEdge]", {}),
+        "pageInfo": ("PageInfo!", {}),
+        "issueCount": ("Int!", {}),
+        "repositoryCount": ("Int!", {}),
+        "userCount": ("Int!", {}),
+    },
+    "SearchResultItemEdge": {"cursor": ("String!", {}), "node": ("SearchResultItem", {})},
     "Node": {"id": ("ID!", {})},
     "__Type": {
         "name": ("String", {}),
@@ -209,7 +238,34 @@ ENUMS = {
     "__TypeKind": ["SCALAR", "OBJECT", "INTERFACE", "UNION", "ENUM", "INPUT_OBJECT", "LIST", "NON_NULL"],
 }
 
-SCALARS = {"String", "Int", "Float", "Boolean", "ID"}
+INPUTS = {
+    "CreatePullRequestInput": {
+        "repositoryId": "ID!",
+        "baseRefName": "String!",
+        "headRefName": "String!",
+        "title": "String!",
+        "body": "String",
+        "draft": "Boolean",
+        "maintainerCanModify": "Boolean",
+    },
+    "IssueOrder": {
+        "field": "IssueOrderField!",
+        "direction": "OrderDirection!",
+    },
+    "IssueFilters": {
+        "since": "DateTime",
+        "labels": "[String!]",
+        "states": "[IssueState!]",
+    },
+}
+
+UNIONS = {
+    "SearchResultItem": ["Issue", "PullRequest", "Repository", "User"],
+    "Node": ["Repository", "Issue", "PullRequest", "User"],
+    "GitObject": ["Commit"],
+}
+
+SCALARS = {"String", "Int", "Float", "Boolean", "ID", "URI", "DateTime", "GitObjectID"}
 
 
 def type_kind(name: str) -> str:
@@ -217,8 +273,12 @@ def type_kind(name: str) -> str:
         return "SCALAR"
     if name in ENUMS:
         return "ENUM"
-    if name in ("CreatePullRequestInput", "IssueOrder"):
+    if name in INPUTS:
         return "INPUT_OBJECT"
+    if name in UNIONS:
+        return "UNION"
+    if name in ("RepositoryOwner", "Node", "GitObject"):
+        return "INTERFACE"
     if name in SCHEMA:
         return "OBJECT"
     return "OBJECT"
@@ -233,13 +293,15 @@ def parse_type_name(text: str) -> dict:
     return {"kind": type_kind(text), "name": text, "ofType": None, "description": None}
 
 
-def unwrap(text: str) -> tuple[str, bool]:
-    """Return (inner named type, is_list)."""
-    text = text.strip().rstrip("!")
-    is_list = text.startswith("[")
-    if is_list:
-        text = text[1:-1].strip().rstrip("!")
-    return text, is_list
+def unwrap(text: str) -> str:
+    text = text.strip()
+    while text.endswith("!"):
+        text = text[:-1]
+    if text.startswith("[") and text.endswith("]"):
+        text = text[1:-1].strip()
+        while text.endswith("!"):
+            text = text[:-1]
+    return text
 
 
 @dataclass
@@ -250,6 +312,7 @@ class Sel:
     args: list = field(default_factory=list)
     selection: list = field(default_factory=list)
     on_type: str = ""
+    directives: list = field(default_factory=list)
     line: int = 1
     col: int = 1
 
@@ -259,6 +322,7 @@ class Op:
     kind: str
     name: str
     selection: list
+    defaults: dict = field(default_factory=dict)
     line: int = 1
 
 
@@ -278,7 +342,7 @@ class Parser:
         self.col = 1
 
     def parse(self) -> tuple[list[Op], dict[str, Frag]]:
-        ops = []
+        ops: list[Op] = []
         frags: dict[str, Frag] = {}
         self._skip()
         if self.i >= self.n:
@@ -293,14 +357,14 @@ class Parser:
                 frag = self._fragment()
                 frags[frag.name] = frag
             else:
-                raise ValueError(f"unexpected token near {self.s[self.i:self.i+20]!r}")
+                raise ValueError(f"unexpected token near {self.s[self.i:self.i + 20]!r}")
             self._skip()
         if not ops:
             raise ValueError("document has no operation")
         return ops, frags
 
     def _operation(self) -> Op:
-        line, col = self.line, self.col
+        line = self.line
         kind = "query"
         if self._keyword("query"):
             kind = "query"
@@ -309,32 +373,31 @@ class Parser:
         elif self._keyword("subscription"):
             kind = "subscription"
         self._skip()
-        name = ""
-        if self._peek_name():
-            name = self._name()
+        name = self._name() if self._peek_name() else ""
+        defaults: dict = {}
         if self._eat("("):
             self._skip()
             while not self._eat(")"):
                 self._expect("$")
-                self._name()
+                var = self._name()
                 self._skip()
                 self._expect(":")
                 self._parse_type_expr()
                 self._skip()
                 if self._eat("="):
-                    self._value()
+                    defaults[var] = self._value()
                 self._skip()
                 self._eat(",")
                 self._skip()
-        self._skip_directives()
-        return Op(kind, name, self._selection_set(), line)
+        self._directives()
+        return Op(kind, name, self._selection_set(), defaults, line)
 
     def _fragment(self) -> Frag:
         self._expect_keyword("fragment")
         name = self._name()
         self._expect_keyword("on")
         on_type = self._name()
-        self._skip_directives()
+        self._directives()
         return Frag(name, on_type, self._selection_set())
 
     def _selection_set(self) -> list:
@@ -356,14 +419,13 @@ class Parser:
             self._skip()
             if self._keyword("on"):
                 on_type = self._name()
-                self._skip_directives()
-                return Sel("inline", on_type=on_type, selection=self._selection_set(), line=line, col=col)
+                directives = self._directives()
+                return Sel("inline", on_type=on_type, selection=self._selection_set(), directives=directives, line=line, col=col)
             if self._peek_name():
                 name = self._name()
-                self._skip_directives()
-                return Sel("spread", name=name, line=line, col=col)
-            self._skip_directives()
-            return Sel("inline", selection=self._selection_set(), line=line, col=col)
+                return Sel("spread", name=name, directives=self._directives(), line=line, col=col)
+            directives = self._directives()
+            return Sel("inline", selection=self._selection_set(), directives=directives, line=line, col=col)
         name = self._name()
         alias = ""
         self._skip()
@@ -380,12 +442,33 @@ class Parser:
                 self._skip()
                 self._eat(",")
                 self._skip()
-        self._skip_directives()
+        directives = self._directives()
         selection = self._selection_set() if self._peek("{") else []
-        return Sel("field", name=name, alias=alias, args=args, selection=selection, line=line, col=col)
+        return Sel("field", name=name, alias=alias, args=args, selection=selection, directives=directives, line=line, col=col)
+
+    def _directives(self) -> list:
+        found = []
+        self._skip()
+        while self._eat("@"):
+            name = self._name()
+            args = []
+            if self._eat("("):
+                self._skip()
+                while not self._eat(")"):
+                    aname = self._name()
+                    self._expect(":")
+                    args.append((aname, self._value()))
+                    self._skip()
+                    self._eat(",")
+                    self._skip()
+            found.append((name, args))
+            self._skip()
+        return found
 
     def _value(self):
         self._skip()
+        if self.s.startswith('"""', self.i):
+            return ("str", self._block_string())
         if self._eat("$"):
             return ("var", self._name())
         if self._eat("["):
@@ -409,8 +492,6 @@ class Parser:
                 self._skip()
             return ("obj", obj)
         if self._eat('"'):
-            if self.s.startswith('""', self.i - 1) and self._peek('"'):
-                return ("str", self._block_string())
             return ("str", self._string())
         if self._keyword("true"):
             return ("bool", True)
@@ -422,20 +503,18 @@ class Parser:
             return ("num", self._number())
         if self._peek_name():
             return ("enum", self._name())
-        raise ValueError(f"bad value near {self.s[self.i:self.i+16]!r}")
+        raise ValueError(f"bad value near {self.s[self.i:self.i + 16]!r}")
 
     def _block_string(self) -> str:
-        # caller already consumed the first quote of """
-        if not self.s.startswith('""', self.i):
-            raise ValueError("bad block string")
-        self._bump(2)
+        self._bump(3)
         end = self.s.find('"""', self.i)
         if end < 0:
             raise ValueError("unterminated block string")
         text = self.s[self.i:end]
-        self._bump_text(text)
-        self._bump(3)
-        return text.strip("\n")
+        self._bump(end - self.i + 3)
+        if text.startswith("\n"):
+            text = text[1:]
+        return text
 
     def _string(self) -> str:
         out = []
@@ -446,6 +525,8 @@ class Parser:
                 return "".join(out)
             if ch == "\\":
                 self._bump()
+                if self.i >= self.n:
+                    break
                 esc = self.s[self.i]
                 self._bump()
                 mapping = {"n": "\n", "t": "\t", "r": "\r", '"': '"', "\\": "\\", "/": "/"}
@@ -484,21 +565,6 @@ class Parser:
             self._name()
         self._eat("!")
 
-    def _skip_directives(self) -> None:
-        self._skip()
-        while self._eat("@"):
-            self._name()
-            if self._eat("("):
-                depth = 1
-                while self.i < self.n and depth:
-                    if self._eat("("):
-                        depth += 1
-                    elif self._eat(")"):
-                        depth -= 1
-                    else:
-                        self._bump()
-            self._skip()
-
     def _at_keyword(self, word: str) -> bool:
         end = self.i + len(word)
         return self.s.startswith(word, self.i) and (end >= self.n or not (self.s[end].isalnum() or self.s[end] == "_"))
@@ -522,7 +588,7 @@ class Parser:
         self._skip()
         start = self.i
         if self.i >= self.n or not (self.s[self.i].isalpha() or self.s[self.i] == "_"):
-            raise ValueError(f"expected name near {self.s[self.i:self.i+12]!r}")
+            raise ValueError(f"expected name near {self.s[self.i:self.i + 12]!r}")
         self._bump()
         while self.i < self.n and (self.s[self.i].isalnum() or self.s[self.i] == "_"):
             self._bump()
@@ -545,7 +611,7 @@ class Parser:
 
     def _expect(self, token: str) -> None:
         if not self._eat(token):
-            raise ValueError(f"expected {token}")
+            raise ValueError(f"expected {token!r}")
 
     def _skip(self) -> None:
         while self.i < self.n:
@@ -554,7 +620,7 @@ class Parser:
                 self._bump()
                 continue
             if ch == "#":
-                while self.i < self.n and self.s[self.i] not in "\n":
+                while self.i < self.n and self.s[self.i] != "\n":
                     self._bump()
                 continue
             break
@@ -567,14 +633,6 @@ class Parser:
             else:
                 self.col += 1
             self.i += 1
-
-    def _bump_text(self, text: str) -> None:
-        self._bump(len(text))
-
-
-# The method above was duplicated in the class body by mistake if I left a stub.
-# The real _selection is defined. The stub raises if the later definition didn't override.
-# In Python the later def wins, so the stub is overwritten. Good.
 
 
 def _eval(node, variables: dict):
@@ -590,6 +648,16 @@ def _eval(node, variables: dict):
 
 def _args(sel: Sel, variables: dict) -> dict:
     return {name: _eval(value, variables) for name, value in sel.args}
+
+
+def _skipped(sel: Sel, variables: dict) -> bool:
+    for name, args in sel.directives:
+        values = {key: _eval(value, variables) for key, value in args}
+        if name == "skip" and values.get("if"):
+            return True
+        if name == "include" and not values.get("if"):
+            return True
+    return False
 
 
 class GRepo:
@@ -619,11 +687,14 @@ class GPull:
 
 
 class Conn:
-    __slots__ = ("nodes", "total")
+    __slots__ = ("nodes", "total", "issue_count", "repository_count", "user_count")
 
-    def __init__(self, nodes, total=None):
+    def __init__(self, nodes, total=None, issue_count=0, repository_count=0, user_count=0):
         self.nodes = nodes
         self.total = len(nodes) if total is None else total
+        self.issue_count = issue_count
+        self.repository_count = repository_count
+        self.user_count = user_count
 
 
 class Intro:
@@ -634,19 +705,50 @@ class Intro:
         self.kind = kind or (type_kind(name) if name else None)
 
 
+def _runtime(value, fallback: str) -> str:
+    if isinstance(value, GIssue):
+        return "Issue"
+    if isinstance(value, GPull):
+        return "PullRequest"
+    if isinstance(value, GRepo):
+        return "Repository"
+    if isinstance(value, dict) and "login" in value and "number" not in value and "path" not in value:
+        return "User"
+    return fallback
+
+
+def _applies(on_type: str, schema_type: str, runtime: str) -> bool:
+    if not on_type or on_type in (schema_type, runtime):
+        return True
+    if on_type == "RepositoryOwner" and runtime == "User":
+        return True
+    if on_type == "Node":
+        return True
+    if on_type == "GitObject" and runtime in ("Commit", "GitObject"):
+        return True
+    if on_type in UNIONS and runtime in UNIONS.get(on_type, ()):
+        return True
+    return False
+
+
+def _user(store) -> dict:
+    return {
+        "id": node_id("User", store.user_id),
+        "login": store.login,
+        "name": store.login,
+        "url": f"/{store.login}",
+        "avatarUrl": "",
+    }
+
+
 def _page(conn: Conn) -> dict:
-    total = conn.total
     size = len(conn.nodes)
     return {
-        "hasNextPage": total > size,
+        "hasNextPage": conn.total > size,
         "hasPreviousPage": False,
         "startCursor": "0" if size else None,
         "endCursor": str(size - 1) if size else None,
     }
-
-
-def _user(store):
-    return {"id": node_id("User", store.user_id), "login": store.login, "name": store.login, "url": f"/{store.login}", "avatarUrl": ""}
 
 
 def _resolve(type_name: str, field: str, parent, args: dict, store):
@@ -658,13 +760,21 @@ def _resolve(type_name: str, field: str, parent, args: dict, store):
             return _user(store)
         if field == "node":
             return _node(store, args.get("id"))
+        if field == "search":
+            return _search(store, args)
         if field == "__type":
             name = args.get("name")
-            if name in SCHEMA or name in ENUMS or name in SCALARS or name in ("CreatePullRequestInput", "IssueOrder"):
+            if name in SCHEMA or name in ENUMS or name in SCALARS or name in INPUTS or name in UNIONS:
                 return Intro(name)
             return None
         if field == "__schema":
-            return {"description": "forge", "types": [Intro(name) for name in list(SCHEMA) + list(ENUMS)], "queryType": Intro("Query"), "mutationType": Intro("Mutation")}
+            names = list(SCHEMA) + list(ENUMS) + list(INPUTS)
+            return {
+                "description": "forge",
+                "types": [Intro(name) for name in names],
+                "queryType": Intro("Query"),
+                "mutationType": Intro("Mutation"),
+            }
     if type_name == "Mutation" and field == "createPullRequest":
         return _create_pull(store, args.get("input") or {})
     if type_name == "Repository":
@@ -673,12 +783,18 @@ def _resolve(type_name: str, field: str, parent, args: dict, store):
         return _issue_field(parent, field, args)
     if type_name == "PullRequest":
         return _pull_field(parent, field, args)
-    if type_name == "Ref":
-        return parent.get(field) if isinstance(parent, dict) else None
-    if type_name in ("GitObject", "Commit", "User", "RepositoryOwner", "PageInfo", "PullRequestChangedFile", "Label", "CreatePullRequestPayload", "IssueEdge", "PullRequestEdge", "PullRequestChangedFileEdge", "IssueComment"):
+    if type_name in (
+        "Ref", "GitObject", "Commit", "User", "RepositoryOwner", "PageInfo",
+        "PullRequestChangedFile", "Label", "CreatePullRequestPayload",
+        "IssueEdge", "PullRequestEdge", "PullRequestChangedFileEdge",
+        "IssueComment", "SearchResultItemEdge",
+    ):
         if isinstance(parent, dict):
             return parent.get(field)
-    if type_name in ("IssueConnection", "PullRequestConnection", "PullRequestChangedFileConnection", "LabelConnection", "IssueCommentConnection"):
+    if type_name in (
+        "IssueConnection", "PullRequestConnection", "PullRequestChangedFileConnection",
+        "LabelConnection", "IssueCommentConnection", "SearchResultItemConnection",
+    ):
         if field == "nodes":
             return parent.nodes
         if field == "totalCount":
@@ -686,17 +802,18 @@ def _resolve(type_name: str, field: str, parent, args: dict, store):
         if field == "pageInfo":
             return _page(parent)
         if field == "edges":
-            return [{"cursor": str(i), "node": node} for i, node in enumerate(parent.nodes)]
+            return [{"cursor": str(index), "node": node} for index, node in enumerate(parent.nodes)]
+        if field == "issueCount":
+            return parent.issue_count
+        if field == "repositoryCount":
+            return parent.repository_count
+        if field == "userCount":
+            return parent.user_count
     if type_name == "__Type":
-        return _intro_type_field(parent, field)
-    if type_name == "__Field":
-        return parent.get(field) if isinstance(parent, dict) else None
-    if type_name == "__EnumValue":
-        return parent.get(field) if isinstance(parent, dict) else None
-    if type_name == "__InputValue":
-        return parent.get(field) if isinstance(parent, dict) else None
-    if type_name == "__Schema":
-        return parent.get(field) if isinstance(parent, dict) else None
+        return _intro_type_field(parent, field, args)
+    if type_name in ("__Field", "__EnumValue", "__InputValue", "__Schema"):
+        if isinstance(parent, dict):
+            return parent.get(field)
     if isinstance(parent, dict) and field in parent:
         return parent[field]
     return None
@@ -710,6 +827,18 @@ def _node(store, gid):
     if kind == "Repository":
         repo = store.get_repo_by_id(num)
         return GRepo(repo, store) if repo else None
+    if kind == "Issue":
+        for repo in store.list_repos():
+            for issue in repo.issues.values():
+                if issue.id == num:
+                    return GIssue(repo, issue, store)
+        return None
+    if kind == "PullRequest":
+        for repo in store.list_repos():
+            for pull in repo.pulls.values():
+                if pull.id == num:
+                    return GPull(repo, pull, store)
+        return None
     if kind == "User":
         return _user(store)
     return None
@@ -744,9 +873,7 @@ def _repo_field(parent: GRepo, field: str, args: dict):
     if field == "updatedAt":
         return repo.updated_at
     if field == "defaultBranchRef":
-        from gitstore import ensure_git
-
-        git = ensure_git(repo, store)
+        git = gitstore.ensure_git(repo, store)
         sha = git.branch_sha(repo.default_branch)
         if sha is None:
             return None
@@ -767,6 +894,9 @@ def _repo_field(parent: GRepo, field: str, args: dict):
 def _issue_conn(parent: GRepo, args: dict) -> Conn:
     repo = parent.repo
     states = args.get("states")
+    filters = args.get("filterBy") or {}
+    if not states and isinstance(filters, dict):
+        states = filters.get("states")
     wanted = None
     if states:
         wanted = set()
@@ -775,27 +905,28 @@ def _issue_conn(parent: GRepo, args: dict) -> Conn:
                 wanted.add("open")
             elif state == "CLOSED":
                 wanted.add("closed")
+    labels = args.get("labels")
+    if not labels and isinstance(filters, dict):
+        labels = filters.get("labels")
     with repo.lock:
         items = [repo.issues[number] for number in repo.issue_order if number in repo.issues]
     if wanted is not None:
         items = [issue for issue in items if issue.state in wanted]
+    if labels:
+        needed = {str(label).lower() for label in labels}
+        items = [issue for issue in items if needed <= {name.lower() for name in issue.labels}]
     order = args.get("orderBy") or {"field": "CREATED_AT", "direction": "DESC"}
     direction = (order or {}).get("direction") or "DESC"
     field_name = (order or {}).get("field") or "CREATED_AT"
-    reverse = direction == "DESC"
+    reverse = direction != "ASC"
 
-    def key(issue):
-        if field_name == "UPDATED_AT":
-            primary = issue.updated_at
-        else:
-            primary = issue.created_at
-        # Number breaks ties in the same direction as the primary key, so DESC
-        # puts the higher number first when timestamps match.
+    def sort_key(issue):
+        primary = issue.updated_at if field_name == "UPDATED_AT" else issue.created_at
         return (primary, issue.number)
 
-    items.sort(key=key, reverse=reverse)
-    first = args.get("first")
+    items.sort(key=sort_key, reverse=reverse)
     total = len(items)
+    first = args.get("first")
     if first is not None:
         items = items[: max(0, int(first))]
     return Conn([GIssue(repo, issue, parent.store) for issue in items], total)
@@ -808,10 +939,12 @@ def _pull_conn(parent: GRepo, args: dict) -> Conn:
     states = args.get("states")
     if states:
         wanted = set(states)
+
         def keep(pull):
             if pull.merged:
                 return "MERGED" in wanted or "CLOSED" in wanted
             return pull.state.upper() in wanted
+
         pulls = [pull for pull in pulls if keep(pull)]
     head = args.get("headRefName")
     base = args.get("baseRefName")
@@ -860,24 +993,39 @@ def _issue_field(parent: GIssue, field: str, args: dict):
         for name in issue.labels:
             label = repo.label_named(name)
             if label is not None:
-                nodes.append({"id": node_id("Label", label.id), "name": label.name, "color": label.color, "description": label.description})
-        first = args.get("first")
+                nodes.append({
+                    "id": node_id("Label", label.id),
+                    "name": label.name,
+                    "color": label.color,
+                    "description": label.description,
+                })
         total = len(nodes)
+        first = args.get("first")
         if first is not None:
             nodes = nodes[: int(first)]
         return Conn(nodes, total)
     if field == "comments":
-        return Conn([], 0)
+        comments = repo.comments.get(issue.number, [])
+        nodes = [{"id": node_id("IssueComment", comment.id), "body": comment.body, "author": _user(store)} for comment in comments]
+        return Conn(nodes, len(comments))
     return None
+
+
+def _change_type(status: str) -> str:
+    return {"added": "ADDED", "removed": "DELETED", "modified": "MODIFIED"}.get(status, "MODIFIED")
+
+
+def _pull_files(git, base_sha, head_sha) -> list[dict]:
+    if not git or not base_sha or not head_sha:
+        return []
+    return git.diff(base_sha, head_sha)
 
 
 def _pull_field(parent: GPull, field: str, args: dict):
     pull = parent.pull
     repo = parent.repo
     store = parent.store
-    from gitstore import ensure_git
-
-    git = ensure_git(repo, store)
+    git = gitstore.ensure_git(repo, store)
     head_sha = git.branch_sha(pull.head)
     base_sha = git.branch_sha(pull.base)
     if field == "id":
@@ -919,16 +1067,16 @@ def _pull_field(parent: GPull, field: str, args: dict):
     if field == "closedAt":
         return pull.closed_at
     if field in ("files", "additions", "deletions", "changedFiles"):
-        files = git.diff(base_sha, head_sha) if base_sha and head_sha else []
+        files = _pull_files(git, base_sha, head_sha)
         if field == "files":
             nodes = [{
                 "path": item["path"],
                 "additions": item["additions"],
                 "deletions": item["deletions"],
-                "changeType": item["status"].upper(),
+                "changeType": _change_type(item["status"]),
             } for item in files]
-            first = args.get("first")
             total = len(nodes)
+            first = args.get("first")
             if first is not None:
                 nodes = nodes[: int(first)]
             return Conn(nodes, total)
@@ -941,8 +1089,7 @@ def _pull_field(parent: GPull, field: str, args: dict):
 
 
 def _create_pull(store, payload: dict) -> dict:
-    from gitstore import ensure_git
-
+    client = payload.get("clientMutationId")
     repo = None
     gid = payload.get("repositoryId")
     parsed = parse_node_id(str(gid)) if gid is not None else None
@@ -951,51 +1098,122 @@ def _create_pull(store, payload: dict) -> dict:
     elif isinstance(gid, int) or (isinstance(gid, str) and str(gid).isdigit()):
         repo = store.get_repo_by_id(int(gid))
     if repo is None:
-        return {"pullRequest": None, "clientMutationId": payload.get("clientMutationId"), "_error": "repository not found"}
-    ensure_git(repo, store)
+        return {"pullRequest": None, "clientMutationId": client, "_error": "repository not found"}
+    gitstore.ensure_git(repo, store)
+    title = payload.get("title") or "Pull request"
     status, body = store.create_pull(repo, {
-        "title": payload.get("title") or "Pull request",
+        "title": title,
         "head": payload.get("headRefName") or "",
         "base": payload.get("baseRefName") or repo.default_branch,
         "body": payload.get("body"),
     })
     if status != 201:
-        return {"pullRequest": None, "clientMutationId": payload.get("clientMutationId"), "_error": body.get("message", "validation failed")}
+        message = body.get("message", "validation failed") if isinstance(body, dict) else "validation failed"
+        return {"pullRequest": None, "clientMutationId": client, "_error": message}
     pull = repo.pulls[body["number"]]
-    return {"pullRequest": GPull(repo, pull, store), "clientMutationId": payload.get("clientMutationId")}
+    return {"pullRequest": GPull(repo, pull, store), "clientMutationId": client}
 
 
-def _intro_type_field(parent, field: str):
+def _search(store, args: dict) -> Conn:
+    query = str(args.get("query") or "")
+    kind = args.get("type") or "ISSUE"
+    owner = None
+    repo_name = None
+    state = None
+    text: list[str] = []
+    want_pr = False
+    for token in query.split():
+        lowered = token.lower()
+        if lowered.startswith("repo:") and "/" in token:
+            owner, repo_name = token.split(":", 1)[1].split("/", 1)
+        elif lowered in ("is:open", "state:open"):
+            state = "open"
+        elif lowered in ("is:closed", "state:closed"):
+            state = "closed"
+        elif lowered in ("is:pr", "is:pull-request", "type:pr"):
+            want_pr = True
+        elif lowered in ("is:issue", "type:issue"):
+            want_pr = False
+        elif lowered.startswith("is:") or lowered.startswith("type:") or lowered.startswith("repo:"):
+            continue
+        else:
+            text.append(lowered)
+    needle = " ".join(text)
+    nodes = []
+    issue_count = repository_count = user_count = 0
+    if kind == "REPOSITORY":
+        for repo in store.list_repos():
+            if repo_name and repo.name.lower() != repo_name.lower():
+                continue
+            if needle and needle not in repo.name.lower() and needle not in (repo.description or "").lower():
+                continue
+            nodes.append(GRepo(repo, store))
+        repository_count = len(nodes)
+    elif kind == "USER":
+        login = store.login
+        if not needle or needle in login.lower():
+            nodes.append(_user(store))
+        user_count = len(nodes)
+    else:
+        repos = store.list_repos()
+        for repo in repos:
+            if owner and owner.lower() != store.login.lower():
+                continue
+            if repo_name and repo.name.lower() != repo_name.lower():
+                continue
+            if want_pr:
+                for pull in repo.pulls.values():
+                    if state == "open" and pull.state != "open":
+                        continue
+                    if state == "closed" and pull.state == "open":
+                        continue
+                    hay = f"{pull.title}\n{pull.body or ''}".lower()
+                    if needle and needle not in hay:
+                        continue
+                    nodes.append(GPull(repo, pull, store))
+            else:
+                for issue in store.list_issues(repo, state or "all"):
+                    hay = f"{issue.title}\n{issue.body or ''}".lower()
+                    if needle and needle not in hay:
+                        continue
+                    nodes.append(GIssue(repo, issue, store))
+        issue_count = len(nodes)
+    total = len(nodes)
+    first = args.get("first")
+    if first is not None:
+        nodes = nodes[: max(0, int(first))]
+    return Conn(nodes, total, issue_count, repository_count, user_count)
+
+
+def _intro_type_field(parent, field: str, args: dict):
+    del args
     if isinstance(parent, dict):
         return parent.get(field)
     name = parent.name
-    kind = parent.kind or type_kind(name) if name else None
+    kind = parent.kind or (type_kind(name) if name else None)
     if field == "name":
         return name
     if field == "kind":
         return kind
     if field == "description":
-        return None
+        return name
     if field == "ofType":
         return None
     if field == "fields":
         spec = SCHEMA.get(name or "")
-        if not spec or kind != "OBJECT":
+        if not spec or kind not in ("OBJECT", "INTERFACE"):
             return None
         fields = []
         for fname, (ftype, fargs) in spec.items():
-            if fname.startswith("__") and name not in ("Query",):
-                pass
-            args = [{
-                "name": aname,
-                "description": aname,
-                "type": parse_type_name(atype),
-                "defaultValue": None,
-            } for aname, atype in fargs.items()]
             fields.append({
                 "name": fname,
                 "description": fname,
-                "args": args,
+                "args": [{
+                    "name": aname,
+                    "description": aname,
+                    "type": parse_type_name(atype),
+                    "defaultValue": None,
+                } for aname, atype in fargs.items()],
                 "type": parse_type_name(ftype),
                 "isDeprecated": False,
             })
@@ -1006,33 +1224,79 @@ def _intro_type_field(parent, field: str):
             return None
         return [{"name": value, "description": value, "isDeprecated": False} for value in values]
     if field == "interfaces":
+        if name == "User":
+            return [Intro("RepositoryOwner"), Intro("Node")]
+        if name in ("Repository", "Issue", "PullRequest"):
+            return [Intro("Node")]
+        if name == "Commit":
+            return [Intro("GitObject")]
         return []
     if field == "possibleTypes":
-        return None
+        members = UNIONS.get(name or "")
+        if name == "RepositoryOwner":
+            members = ["User"]
+        if not members:
+            return None
+        return [Intro(member) for member in members]
     if field == "inputFields":
-        return None
+        spec = INPUTS.get(name or "")
+        if not spec:
+            return None
+        return [{
+            "name": aname,
+            "description": aname,
+            "type": parse_type_name(atype),
+            "defaultValue": None,
+        } for aname, atype in spec.items()]
     return None
 
 
-def _expand(selections, type_name: str, frags: dict[str, Frag]):
+def _iter_fields(selections, schema_type: str, runtime: str, frags: dict[str, Frag], variables: dict):
     for sel in selections:
+        if _skipped(sel, variables):
+            continue
         if sel.kind == "field":
             yield sel
         elif sel.kind == "spread":
             frag = frags.get(sel.name)
-            if frag and (frag.on_type == type_name or type_name in ("User",) and frag.on_type in ("RepositoryOwner", "User")):
-                yield from _expand(frag.selection, type_name, frags)
-            elif frag and frag.on_type == type_name:
-                yield from _expand(frag.selection, type_name, frags)
+            if frag and _applies(frag.on_type, schema_type, runtime):
+                yield from _iter_fields(frag.selection, schema_type, runtime, frags, variables)
         elif sel.kind == "inline":
-            if not sel.on_type or sel.on_type == type_name or (type_name == "User" and sel.on_type == "RepositoryOwner"):
-                yield from _expand(sel.selection, sel.on_type or type_name, frags)
+            if _applies(sel.on_type, schema_type, runtime):
+                yield from _iter_fields(sel.selection, schema_type, runtime, frags, variables)
 
 
 def _validate(selections, type_name: str, frags, errors: list) -> None:
+    if type_name not in SCHEMA and type_name in UNIONS:
+        for sel in selections:
+            if sel.kind == "field" and sel.name != "__typename":
+                errors.append({
+                    "message": f'Cannot query field "{sel.name}" on type "{type_name}".',
+                    "locations": [{"line": sel.line, "column": sel.col}],
+                })
+            elif sel.kind == "inline" and sel.on_type:
+                _validate(sel.selection, sel.on_type, frags, errors)
+            elif sel.kind == "spread":
+                frag = frags.get(sel.name)
+                if frag:
+                    _validate(frag.selection, frag.on_type, frags, errors)
+        return
     spec = SCHEMA.get(type_name)
-    for sel in _expand(selections, type_name, frags):
-        if sel.name in ("__typename",):
+    for sel in selections:
+        if sel.kind == "spread":
+            frag = frags.get(sel.name)
+            if frag is None:
+                errors.append({
+                    "message": f'Unknown fragment "{sel.name}".',
+                    "locations": [{"line": sel.line, "column": sel.col}],
+                })
+            else:
+                _validate(frag.selection, frag.on_type, frags, errors)
+            continue
+        if sel.kind == "inline":
+            _validate(sel.selection, sel.on_type or type_name, frags, errors)
+            continue
+        if sel.name == "__typename":
             continue
         if spec is None or sel.name not in spec:
             errors.append({
@@ -1040,25 +1304,45 @@ def _validate(selections, type_name: str, frags, errors: list) -> None:
                 "locations": [{"line": sel.line, "column": sel.col}],
             })
             continue
+        declared, arg_spec = spec[sel.name]
+        provided = {name for name, _value in sel.args}
+        for aname, atype in arg_spec.items():
+            if atype.endswith("!") and aname not in provided:
+                errors.append({
+                    "message": f'Field "{sel.name}" argument "{aname}" of type "{atype}" is required.',
+                    "locations": [{"line": sel.line, "column": sel.col}],
+                })
         if sel.selection:
-            inner, _is_list = unwrap(spec[sel.name][0])
-            if inner in SCHEMA:
+            inner = unwrap(declared)
+            if inner in SCHEMA or inner in UNIONS:
                 _validate(sel.selection, inner, frags, errors)
 
 
 def _exec(type_name: str, parent, selections, store, variables, frags) -> dict:
+    runtime = _runtime(parent, type_name)
+    if type_name == "RepositoryOwner":
+        runtime = "User"
+        schema_type = "User"
+    elif type_name not in SCHEMA and type_name in UNIONS:
+        schema_type = runtime
+    else:
+        schema_type = type_name
     out = {}
-    spec = SCHEMA.get(type_name, {})
-    for sel in _expand(selections, type_name, frags):
+    spec = SCHEMA.get(schema_type, SCHEMA.get(type_name, {}))
+    for sel in _iter_fields(selections, type_name, runtime, frags, variables):
         key = sel.alias or sel.name
         if sel.name == "__typename":
-            out[key] = type_name
+            if type_name == "RepositoryOwner" or schema_type == "User" and type_name != "User":
+                out[key] = "User"
+            elif type_name in UNIONS:
+                out[key] = runtime
+            else:
+                out[key] = schema_type
             continue
         args = _args(sel, variables)
-        value = _resolve(type_name, sel.name, parent, args, store)
-        if isinstance(value, dict) and value.get("_error") and sel.name == "createPullRequest":
-            # Surface a GraphQL error while still returning null payload fields the caller asked for.
-            value = {k: v for k, v in value.items() if k != "_error"}
+        value = _resolve(schema_type, sel.name, parent, args, store)
+        if isinstance(value, dict) and "_error" in value and sel.name == "createPullRequest":
+            value = {item_key: item for item_key, item in value.items() if item_key != "_error"}
         declared = spec.get(sel.name, ("String", {}))[0]
         out[key] = _exec_value(declared, value, sel.selection, store, variables, frags)
     return out
@@ -1073,29 +1357,39 @@ def _exec_value(declared: str, value, selections, store, variables, frags):
     if text.startswith("["):
         inner = text[1:-1]
         return [_exec_value(inner, item, selections, store, variables, frags) for item in value]
-    if text in SCALARS or text in ENUMS:
+    named = unwrap(text)
+    if named in SCALARS or named in ENUMS:
         return value
-    if text in SCHEMA and selections:
-        return _exec(text, value, selections, store, variables, frags)
+    if selections and (named in SCHEMA or named in UNIONS):
+        return _exec(named, value, selections, store, variables, frags)
     return value
 
 
-def execute_document(source: str, variables: dict | None, operation_name: str | None) -> dict:
-    ops, frags = Parser(source).parse()
-    if operation_name:
-        chosen = [op for op in ops if op.name == operation_name]
-        op = chosen[0] if chosen else ops[0]
-    else:
-        op = ops[0]
-    root_type = "Mutation" if op.kind == "mutation" else "Query"
+def _run(op: Op, frags, variables: dict) -> dict:
+    merged = dict(variables or {})
+    for name, default in op.defaults.items():
+        if name not in merged:
+            merged[name] = _eval(default, merged)
+    root = "Mutation" if op.kind == "mutation" else "Query"
     errors: list = []
-    _validate(op.selection, root_type, frags, errors)
+    _validate(op.selection, root, frags, errors)
     if errors:
         return {"data": None, "errors": errors}
-    variables = variables or {}
-    data = _exec(root_type, None, op.selection, get_store(), variables, frags)
-    # Drop an errors key when the document succeeded, including a null repository.
+    data = _exec(root, None, op.selection, get_store(), merged, frags)
     return {"data": data}
+
+
+def execute_document(source: str, variables: dict | None, operation_name: str | None):
+    ops, frags = Parser(source).parse()
+    variables = variables or {}
+    if operation_name:
+        chosen = [op for op in ops if op.name == operation_name]
+        if not chosen:
+            return {"errors": [{"message": f'Unknown operation named "{operation_name}".'}]}
+        return _run(chosen[0], frags, variables)
+    if len(ops) > 1:
+        return [_run(op, frags, variables) for op in ops]
+    return _run(ops[0], frags, variables)
 
 
 def handle(body: bytes) -> tuple:
@@ -1107,21 +1401,21 @@ def handle(body: bytes) -> tuple:
         return 400, dumps({"message": "Problems parsing JSON"}), JSON, ()
     try:
         if isinstance(payload, list):
-            results = [_one(item) for item in payload]
-            return 200, dumps(results), JSON, ()
+            return 200, dumps([_one(item) for item in payload]), JSON, ()
         if not isinstance(payload, dict):
             return 400, dumps({"message": "Problems parsing JSON"}), JSON, ()
-        return 200, dumps(_one(payload)), JSON, ()
+        result = _one(payload)
+        return 200, dumps(result), JSON, ()
     except Exception as exc:
         return 200, dumps({"data": None, "errors": [{"message": f"GraphQL error: {exc}"}]}), JSON, ()
 
 
-def _one(payload: dict) -> dict:
+def _one(payload) -> dict | list:
     if not isinstance(payload, dict):
         return {"errors": [{"message": "Problems parsing JSON"}]}
     query = payload.get("query")
     if not isinstance(query, str) or not query.strip():
-        return {"errors": [{"message": "Problems parsing JSON"}]}
+        return {"errors": [{"message": "Must provide query string."}]}
     variables = payload.get("variables") or {}
     if not isinstance(variables, dict):
         variables = {}

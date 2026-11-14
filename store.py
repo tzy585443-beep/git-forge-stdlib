@@ -1,13 +1,14 @@
-"""In-memory forge state: one login, repositories, labels, and issues.
+"""In-memory forge state: one login, repositories, labels, issues, and pulls.
 
-The login is a single owner for the process. MAKEFUN_SHOP_TOKEN authenticates
-that user; a repository under any other owner is missing (404), never forbidden.
-Timestamps come from MAKEFUN_TRIAL_NOW so two runs of a trial agree.
+The bearer token names a single owner. A repository under any other login is
+missing (404), never forbidden. Timestamps come from MAKEFUN_TRIAL_NOW so two
+runs of a trial agree. Identifiers are monotonic counters, never random.
 """
 
 from __future__ import annotations
 
 import base64
+import itertools
 import os
 import threading
 from datetime import datetime, timezone
@@ -22,7 +23,7 @@ def resolve_login() -> str:
     return "octocat"
 
 
-def _trial_now() -> str:
+def trial_now() -> str:
     raw = os.environ.get("MAKEFUN_TRIAL_NOW", "").strip()
     if not raw:
         return "1970-01-01T00:00:00Z"
@@ -30,12 +31,12 @@ def _trial_now() -> str:
         return datetime.fromtimestamp(int(raw), timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     text = raw[:-1] + "+00:00" if raw.endswith(("Z", "z")) else raw
     try:
-        dt = datetime.fromisoformat(text)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        moment = datetime.fromisoformat(text)
     except ValueError:
         return "1970-01-01T00:00:00Z"
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    return moment.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def node_id(kind: str, number: int) -> str:
@@ -52,14 +53,13 @@ def parse_node_id(value: str) -> tuple[str, int] | None:
 
 
 class Label:
-    __slots__ = ("id", "name", "color", "description", "cache")
+    __slots__ = ("id", "name", "color", "description")
 
     def __init__(self, id_: int, name: str, color: str, description: str):
         self.id = id_
         self.name = name
         self.color = color
         self.description = description
-        self.cache: bytes | None = None
 
 
 class Issue:
@@ -86,65 +86,18 @@ class Issue:
         self.created_at = now
         self.updated_at = now
         self.closed_at: str | None = None
+        # Cached JSON for GET /issues/{number}. Cleared on every mutation.
         self.cache: bytes | None = None
 
 
-class Repo:
-    __slots__ = (
-        "id",
-        "name",
-        "description",
-        "private",
-        "default_branch",
-        "created_at",
-        "updated_at",
-        "auto_init",
-        "labels",
-        "issues",
-        "issue_order",
-        "next_number",
-        "open_count",
-        "pulls",
-        "lock",
-        "git",
-    )
+class Comment:
+    __slots__ = ("id", "body", "created_at", "updated_at")
 
-    def __init__(
-        self,
-        id_: int,
-        name: str,
-        description: str | None,
-        private: bool,
-        default_branch: str,
-        now: str,
-        auto_init: bool,
-    ):
+    def __init__(self, id_: int, body: str, now: str):
         self.id = id_
-        self.name = name
-        self.description = description
-        self.private = private
-        self.default_branch = default_branch or "main"
+        self.body = body
         self.created_at = now
         self.updated_at = now
-        self.auto_init = auto_init
-        self.labels: dict[str, Label] = {}
-        self.issues: dict[int, Issue] = {}
-        self.issue_order: list[int] = []
-        self.next_number = 1
-        self.open_count = 0
-        self.pulls: dict[int, Pull] = {}
-        self.lock = threading.RLock()
-        self.git = None  # filled in when the object database is attached
-
-    def label_named(self, name: str) -> Label | None:
-        found = self.labels.get(name)
-        if found is not None:
-            return found
-        lowered = name.lower()
-        for label in self.labels.values():
-            if label.name.lower() == lowered:
-                return label
-        return None
 
 
 class Pull:
@@ -178,26 +131,95 @@ class Pull:
         self.closed_at: str | None = None
 
 
+class Repo:
+    __slots__ = (
+        "id",
+        "name",
+        "description",
+        "private",
+        "default_branch",
+        "created_at",
+        "updated_at",
+        "auto_init",
+        "labels",
+        "issues",
+        "issue_order",
+        "next_number",
+        "open_count",
+        "pulls",
+        "comments",
+        "lock",
+        "git",
+    )
+
+    def __init__(
+        self,
+        id_: int,
+        name: str,
+        description: str | None,
+        private: bool,
+        default_branch: str,
+        now: str,
+        auto_init: bool,
+    ):
+        self.id = id_
+        self.name = name
+        self.description = description
+        self.private = private
+        self.default_branch = default_branch or "main"
+        self.created_at = now
+        self.updated_at = now
+        self.auto_init = auto_init
+        self.labels: dict[str, Label] = {}
+        self.issues: dict[int, Issue] = {}
+        self.issue_order: list[int] = []
+        self.next_number = 1
+        self.open_count = 0
+        self.pulls: dict[int, Pull] = {}
+        self.comments: dict[int, list] = {}
+        self.lock = threading.RLock()
+        self.git = None
+
+    def label_named(self, name: str) -> Label | None:
+        found = self.labels.get(name)
+        if found is not None:
+            return found
+        lowered = name.lower()
+        for label in self.labels.values():
+            if label.name.lower() == lowered:
+                return label
+        return None
+
+
+def _validation(resource: str, field: str, code: str, message: str | None = None) -> dict:
+    error = {"resource": resource, "field": field, "code": code}
+    if message:
+        error["message"] = message
+    return {"message": "Validation Failed", "errors": [error]}
+
+
 class Store:
     def __init__(self) -> None:
         self.login = resolve_login()
         self.user_id = 1
-        self.now = _trial_now()
+        self.now = trial_now()
         self.lock = threading.RLock()
         self.by_name: dict[str, Repo] = {}
         self.order: list[str] = []
         self._next_repo = 1
-        self._next_obj = 1
+        self._ids = itertools.count(1)
+        self._user: dict | None = None
 
     def alloc_obj(self) -> int:
-        with self.lock:
-            value = self._next_obj
-            self._next_obj += 1
-            return value
+        # itertools.count.__next__ is atomic under the GIL.
+        return next(self._ids)
 
     def user_public(self) -> dict:
+        cached = self._user
+        if cached is not None:
+            return cached
         login = self.login
-        return {
+        cached = {
             "login": login,
             "id": self.user_id,
             "node_id": node_id("User", self.user_id),
@@ -208,14 +230,13 @@ class Store:
             "html_url": f"/{login}",
             "url": "/api/v3/user",
         }
+        self._user = cached
+        return cached
 
     def create_repo(self, data: dict) -> tuple[int, dict]:
         name = data.get("name")
         if not isinstance(name, str) or not name.strip() or "/" in name or name in (".", ".."):
-            return 422, {
-                "message": "Validation Failed",
-                "errors": [{"resource": "Repository", "field": "name", "code": "invalid"}],
-            }
+            return 422, _validation("Repository", "name", "invalid")
         name = name.strip()
         key = name.lower()
         private = bool(data.get("private") or data.get("visibility") == "private")
@@ -223,24 +244,13 @@ class Store:
         if description is not None and not isinstance(description, str):
             description = str(description)
         default_branch = data.get("default_branch") or "main"
-        if not isinstance(default_branch, str) or not default_branch:
+        if not isinstance(default_branch, str) or not default_branch or "/" in default_branch:
             default_branch = "main"
         auto_init = bool(data.get("auto_init"))
         with self.lock:
             if key in self.by_name:
-                return 422, {
-                    "message": "Validation Failed",
-                    "errors": [{"resource": "Repository", "field": "name", "code": "already_exists"}],
-                }
-            repo = Repo(
-                self._next_repo,
-                name,
-                description,
-                private,
-                default_branch,
-                self.now,
-                auto_init,
-            )
+                return 422, _validation("Repository", "name", "already_exists")
+            repo = Repo(self._next_repo, name, description, private, default_branch, self.now, auto_init)
             self._next_repo += 1
             self.by_name[key] = repo
             self.order.append(key)
@@ -249,14 +259,14 @@ class Store:
     def list_repos(self) -> list[Repo]:
         with self.lock:
             keys = list(self.order)
-        # Newest first, matching the user-repos listing GitHub returns.
+        # Newest first, matching the listing GitHub returns for the authenticated user.
         return [self.by_name[key] for key in reversed(keys) if key in self.by_name]
 
     def get_repo(self, owner: str, name: str) -> Repo | None:
         if owner.lower() != self.login.lower():
             return None
-        with self.lock:
-            return self.by_name.get(name.lower())
+        # Dict reads are atomic under the GIL. The timed issue GET must not take the store lock.
+        return self.by_name.get(name.lower())
 
     def get_repo_by_id(self, repo_id: int) -> Repo | None:
         with self.lock:
@@ -270,8 +280,7 @@ class Store:
             return False
         with self.lock:
             key = name.lower()
-            repo = self.by_name.pop(key, None)
-            if repo is None:
+            if self.by_name.pop(key, None) is None:
                 return False
             try:
                 self.order.remove(key)
@@ -286,18 +295,20 @@ class Store:
                 repo.description = description if isinstance(description, str) or description is None else str(description)
             if "private" in data:
                 repo.private = bool(data["private"])
-            if "default_branch" in data and isinstance(data["default_branch"], str) and data["default_branch"]:
+            if isinstance(data.get("default_branch"), str) and data["default_branch"]:
                 repo.default_branch = data["default_branch"]
-            if "name" in data and isinstance(data["name"], str) and data["name"].strip():
+                git = repo.git
+                if git is not None:
+                    git.head_target = f"refs/heads/{repo.default_branch}"
+            if isinstance(data.get("name"), str) and data["name"].strip():
                 new_name = data["name"].strip()
                 new_key = new_name.lower()
+                if "/" in new_name or new_name in (".", ".."):
+                    return _validation("Repository", "name", "invalid")
                 with self.lock:
                     old_key = repo.name.lower()
                     if new_key != old_key and new_key in self.by_name:
-                        return {
-                            "message": "Validation Failed",
-                            "errors": [{"resource": "Repository", "field": "name", "code": "already_exists"}],
-                        }
+                        return _validation("Repository", "name", "already_exists")
                     if new_key != old_key:
                         self.by_name.pop(old_key, None)
                         self.by_name[new_key] = repo
@@ -350,10 +361,7 @@ class Store:
     def create_label(self, repo: Repo, data: dict) -> tuple[int, dict]:
         name = data.get("name")
         if not isinstance(name, str) or not name.strip():
-            return 422, {
-                "message": "Validation Failed",
-                "errors": [{"resource": "Label", "field": "name", "code": "missing"}],
-            }
+            return 422, _validation("Label", "name", "missing")
         name = name.strip()
         color = data.get("color") or "ededed"
         if not isinstance(color, str):
@@ -366,10 +374,7 @@ class Store:
             description = str(description)
         with repo.lock:
             if repo.label_named(name) is not None:
-                return 422, {
-                    "message": "Validation Failed",
-                    "errors": [{"resource": "Label", "field": "name", "code": "already_exists"}],
-                }
+                return 422, _validation("Label", "name", "already_exists")
             label = Label(self.alloc_obj(), name, color, description)
             repo.labels[name] = label
         return 201, self.label_public(label)
@@ -384,49 +389,36 @@ class Store:
             "default": False,
         }
 
-    def create_issue(self, repo: Repo, data: dict) -> tuple[int, dict]:
-        title = data.get("title")
-        if not isinstance(title, str) or not title.strip():
-            return 422, {
-                "message": "Validation Failed",
-                "errors": [{"resource": "Issue", "field": "title", "code": "missing"}],
-            }
-        body = data.get("body")
-        if body is not None and not isinstance(body, str):
-            body = str(body)
-        raw_labels = data.get("labels") or []
-        if isinstance(raw_labels, str):
-            raw_labels = [raw_labels]
-        if not isinstance(raw_labels, list):
-            return 422, {
-                "message": "Validation Failed",
-                "errors": [{"resource": "Issue", "field": "labels", "code": "invalid"}],
-            }
-        names: list[str] = []
-        for item in raw_labels:
+    def _resolve_labels(self, repo: Repo, raw) -> tuple[list[Label] | None, dict | None]:
+        if raw is None:
+            return [], None
+        if isinstance(raw, str):
+            raw = [raw]
+        if not isinstance(raw, list):
+            return None, _validation("Issue", "labels", "invalid")
+        resolved: list[Label] = []
+        for item in raw:
             if isinstance(item, dict):
                 item = item.get("name")
             if not isinstance(item, str) or not item:
-                return 422, {
-                    "message": "Validation Failed",
-                    "errors": [{"resource": "Issue", "field": "labels", "code": "invalid"}],
-                }
-            names.append(item)
+                return None, _validation("Issue", "labels", "invalid")
+            label = repo.label_named(item)
+            if label is None:
+                return None, _validation("Issue", "labels", "invalid", f"Label {item} does not exist")
+            resolved.append(label)
+        return resolved, None
+
+    def create_issue(self, repo: Repo, data: dict) -> tuple[int, dict]:
+        title = data.get("title")
+        if not isinstance(title, str) or not title.strip():
+            return 422, _validation("Issue", "title", "missing")
+        body = data.get("body")
+        if body is not None and not isinstance(body, str):
+            body = str(body)
         with repo.lock:
-            resolved: list[Label] = []
-            for name in names:
-                label = repo.label_named(name)
-                if label is None:
-                    return 422, {
-                        "message": "Validation Failed",
-                        "errors": [{
-                            "resource": "Issue",
-                            "field": "labels",
-                            "code": "invalid",
-                            "message": f"Label {name} does not exist",
-                        }],
-                    }
-                resolved.append(label)
+            resolved, error = self._resolve_labels(repo, data.get("labels") or [])
+            if error is not None or resolved is None:
+                return 422, error or _validation("Issue", "labels", "invalid")
             number = repo.next_number
             repo.next_number += 1
             issue = Issue(self.alloc_obj(), number, title.strip(), body, self.now)
@@ -441,52 +433,20 @@ class Store:
             if "title" in data:
                 title = data["title"]
                 if not isinstance(title, str) or not title.strip():
-                    return 422, {
-                        "message": "Validation Failed",
-                        "errors": [{"resource": "Issue", "field": "title", "code": "missing"}],
-                    }
+                    return 422, _validation("Issue", "title", "missing")
                 issue.title = title.strip()
             if "body" in data:
                 body = data["body"]
                 issue.body = body if isinstance(body, str) or body is None else str(body)
-            if "labels" in data and data["labels"] is not None:
-                raw_labels = data["labels"]
-                if isinstance(raw_labels, str):
-                    raw_labels = [raw_labels]
-                if not isinstance(raw_labels, list):
-                    return 422, {
-                        "message": "Validation Failed",
-                        "errors": [{"resource": "Issue", "field": "labels", "code": "invalid"}],
-                    }
-                resolved = []
-                for item in raw_labels:
-                    if isinstance(item, dict):
-                        item = item.get("name")
-                    if not isinstance(item, str):
-                        return 422, {
-                            "message": "Validation Failed",
-                            "errors": [{"resource": "Issue", "field": "labels", "code": "invalid"}],
-                        }
-                    label = repo.label_named(item)
-                    if label is None:
-                        return 422, {
-                            "message": "Validation Failed",
-                            "errors": [{
-                                "resource": "Issue",
-                                "field": "labels",
-                                "code": "invalid",
-                                "message": f"Label {item} does not exist",
-                            }],
-                        }
-                    resolved.append(label.name)
-                issue.labels = resolved
-            if "state" in data and data["state"] is not None:
+            if data.get("labels") is not None:
+                resolved, error = self._resolve_labels(repo, data.get("labels"))
+                if error is not None or resolved is None:
+                    return 422, error or _validation("Issue", "labels", "invalid")
+                issue.labels = [label.name for label in resolved]
+            if data.get("state") is not None:
                 state = data["state"]
                 if state not in ("open", "closed"):
-                    return 422, {
-                        "message": "Validation Failed",
-                        "errors": [{"resource": "Issue", "field": "state", "code": "invalid"}],
-                    }
+                    return 422, _validation("Issue", "state", "invalid")
                 if state != issue.state:
                     if state == "closed":
                         issue.closed_at = self.now
@@ -531,13 +491,18 @@ class Store:
             "labels_url": f"/api/v3/repos/{full}/issues/{issue.number}/labels{{/name}}",
             "comments_url": f"/api/v3/repos/{full}/issues/{issue.number}/comments",
             "events_url": f"/api/v3/repos/{full}/issues/{issue.number}/events",
-            "pull_request": None,
         }
 
     def issue_bytes(self, repo: Repo, number: int) -> bytes | None:
-        """Cached JSON body for the hot GET /issues/{number} path."""
+        """Cached JSON for the hot GET /issues/{number} path."""
         import json
 
+        issue = repo.issues.get(number)
+        if issue is None:
+            return None
+        cached = issue.cache
+        if cached is not None:
+            return cached
         with repo.lock:
             issue = repo.issues.get(number)
             if issue is None:
@@ -548,50 +513,34 @@ class Store:
 
     def list_issues(self, repo: Repo, state: str) -> list[Issue]:
         with repo.lock:
-            numbers = list(repo.issue_order)
-            issues = [repo.issues[n] for n in numbers if n in repo.issues]
+            issues = [repo.issues[number] for number in repo.issue_order if number in repo.issues]
         if state == "all":
             chosen = issues
         elif state == "closed":
             chosen = [issue for issue in issues if issue.state == "closed"]
         else:
             chosen = [issue for issue in issues if issue.state == "open"]
-        # created_at ties break by number descending, and creation order is ascending.
+        # Same created_at sorts by number in the same direction, so DESC breaks ties by number DESC.
         chosen.sort(key=lambda issue: (issue.created_at, issue.number), reverse=True)
         return chosen
 
     def create_pull(self, repo: Repo, data: dict) -> tuple[int, dict]:
         title = data.get("title")
         if not isinstance(title, str) or not title.strip():
-            return 422, {
-                "message": "Validation Failed",
-                "errors": [{"resource": "PullRequest", "field": "title", "code": "missing"}],
-            }
+            return 422, _validation("PullRequest", "title", "missing")
         head = data.get("head")
         base = data.get("base")
         if not isinstance(head, str) or not head or not isinstance(base, str) or not base:
-            return 422, {
-                "message": "Validation Failed",
-                "errors": [{"resource": "PullRequest", "field": "head", "code": "missing"}],
-            }
+            return 422, _validation("PullRequest", "head", "missing")
+        if ":" in head and head.split(":", 1)[0].lower() != self.login.lower():
+            return 422, _validation("PullRequest", "head", "invalid")
         head_branch = head.split(":", 1)[1] if ":" in head else head
         base_branch = base.split(":", 1)[1] if ":" in base else base
-        if ":" in head and head.split(":", 1)[0].lower() != self.login.lower():
-            return 422, {
-                "message": "Validation Failed",
-                "errors": [{"resource": "PullRequest", "field": "head", "code": "invalid"}],
-            }
         git = repo.git
         if git is None or git.branch_sha(head_branch) is None or git.branch_sha(base_branch) is None:
-            return 422, {
-                "message": "Validation Failed",
-                "errors": [{"resource": "PullRequest", "field": "head", "code": "invalid"}],
-            }
+            return 422, _validation("PullRequest", "head", "invalid")
         if head_branch == base_branch:
-            return 422, {
-                "message": "Validation Failed",
-                "errors": [{"resource": "PullRequest", "field": "head", "code": "invalid"}],
-            }
+            return 422, _validation("PullRequest", "head", "invalid")
         body = data.get("body")
         if body is not None and not isinstance(body, str):
             body = str(body)
@@ -610,14 +559,11 @@ class Store:
         git = repo.git
         head_sha = git.branch_sha(pull.head) if git else None
         base_sha = git.branch_sha(pull.base) if git else None
-        if git and head_sha and base_sha and pull.state == "open":
+        if git is not None and head_sha and base_sha and pull.state == "open":
             mergeable = git.mergeable(base_sha, head_sha)
         else:
             mergeable = False
-        files = git.diff(base_sha, head_sha) if git and base_sha and head_sha else []
-        additions = sum(item["additions"] for item in files)
-        deletions = sum(item["deletions"] for item in files)
-        commits = git.ahead(base_sha, head_sha) if git and base_sha and head_sha else 0
+        files = git.diff(base_sha, head_sha) if git is not None and base_sha and head_sha else []
         return {
             "id": pull.id,
             "node_id": node_id("PullRequest", pull.id),
@@ -645,9 +591,9 @@ class Store:
                 "repo": repo_obj,
                 "user": self.user_public(),
             },
-            "commits": commits,
-            "additions": additions,
-            "deletions": deletions,
+            "commits": git.ahead(base_sha, head_sha) if git is not None and base_sha and head_sha else 0,
+            "additions": sum(item["additions"] for item in files),
+            "deletions": sum(item["deletions"] for item in files),
             "changed_files": len(files),
             "html_url": f"/{full}/pull/{pull.number}",
             "url": f"/api/v3/repos/{full}/pulls/{pull.number}",
@@ -669,8 +615,8 @@ class Store:
         expected = data.get("sha")
         if isinstance(expected, str) and expected and head_sha != expected:
             return 409, {"message": "Head branch was modified"}
-        title = data.get("commit_title") if isinstance(data.get("commit_title"), str) else pull.title
-        body = data.get("commit_message") if isinstance(data.get("commit_message"), str) else (pull.body or "")
+        title = data["commit_title"] if isinstance(data.get("commit_title"), str) and data["commit_title"] else pull.title
+        body = data["commit_message"] if isinstance(data.get("commit_message"), str) else (pull.body or "")
         message = f"{title} (#{pull.number})\n"
         if body:
             message += "\n" + body.strip() + "\n"
@@ -693,6 +639,38 @@ class Store:
             repo.open_count = max(0, repo.open_count - 1)
             repo.updated_at = self.now
         return 200, {"sha": sha, "merged": True, "message": "Pull Request successfully merged"}
+
+    def create_comment(self, repo: Repo, number: int, data: dict) -> tuple[int, dict]:
+        body = data.get("body")
+        if not isinstance(body, str) or not body:
+            return 422, _validation("IssueComment", "body", "missing")
+        with repo.lock:
+            if number not in repo.issues and number not in repo.pulls:
+                return 404, {"message": "Not Found"}
+            comment = Comment(self.alloc_obj(), body, self.now)
+            repo.comments.setdefault(number, []).append(comment)
+        return 201, self.comment_public(repo, number, comment)
+
+    def list_comments(self, repo: Repo, number: int) -> list | None:
+        with repo.lock:
+            if number not in repo.issues and number not in repo.pulls:
+                return None
+            return list(repo.comments.get(number, ()))
+
+    def comment_public(self, repo: Repo, number: int, comment: Comment) -> dict:
+        full = f"{self.login}/{repo.name}"
+        return {
+            "id": comment.id,
+            "node_id": node_id("IssueComment", comment.id),
+            "body": comment.body,
+            "user": self.user_public(),
+            "created_at": comment.created_at,
+            "updated_at": comment.updated_at,
+            "author_association": "OWNER",
+            "html_url": f"/{full}/issues/{number}#issuecomment-{comment.id}",
+            "url": f"/api/v3/repos/{full}/issues/comments/{comment.id}",
+            "issue_url": f"/api/v3/repos/{full}/issues/{number}",
+        }
 
     def pull_as_issue(self, repo: Repo, pull: Pull) -> dict:
         full = f"{self.login}/{repo.name}"
